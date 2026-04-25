@@ -143,10 +143,6 @@ async fn handle_log(
                         symbol,
                         leader_pair_index: pair_idx,
                         leader_position_index: pos_idx,
-                        leader_exec_price: exec_price,
-                        leader_pnl_pct: pnl,
-                        source_tx: tx_hash.clone(),
-                        source_block: block,
                     }
                 };
                 if let Err(e) = tx.send(intent).await {
@@ -183,10 +179,6 @@ async fn handle_log(
                         symbol,
                         leader_pair_index: pair_idx,
                         leader_position_index: pos_idx,
-                        leader_exec_price: exec_price,
-                        leader_pnl_pct: pnl,
-                        source_tx: tx_hash.clone(),
-                        source_block: block,
                     }
                 } else {
                     info!(

@@ -45,10 +45,6 @@ pub enum TradeIntent {
         symbol: String,
         leader_pair_index: u64,
         leader_position_index: u64,
-        leader_exec_price: f64,
-        leader_pnl_pct: f64,
-        source_tx: String,
-        source_block: u64,
     },
 }
 
@@ -56,29 +52,6 @@ impl TradeIntent {
     pub fn leader(&self) -> Address {
         match self {
             TradeIntent::Open { leader, .. } | TradeIntent::Close { leader, .. } => *leader,
-        }
-    }
-
-    pub fn symbol(&self) -> &str {
-        match self {
-            TradeIntent::Open { symbol, .. } | TradeIntent::Close { symbol, .. } => symbol,
-        }
-    }
-
-    pub fn key(&self) -> (Address, u64, u64) {
-        match self {
-            TradeIntent::Open {
-                leader,
-                leader_pair_index,
-                leader_position_index,
-                ..
-            }
-            | TradeIntent::Close {
-                leader,
-                leader_pair_index,
-                leader_position_index,
-                ..
-            } => (*leader, *leader_pair_index, *leader_position_index),
         }
     }
 }

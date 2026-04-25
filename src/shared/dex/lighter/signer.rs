@@ -17,7 +17,10 @@ use eyre::{Context, Result, eyre};
 use libloading::{Library, Symbol};
 use tracing::info;
 
+/// Mirror of the Go `SignedTxResponse` C struct. The `tx_type` byte is
+/// part of the ABI layout but we don't consume it in Rust.
 #[repr(C)]
+#[allow(dead_code)]
 struct CSignedTxResponse {
     tx_type: u8,
     tx_info: *mut c_char,
@@ -65,20 +68,8 @@ pub struct LighterSigner {
     pub account_index: i64,
 }
 
-pub struct SignedTx {
-    pub tx_type: u8,
-    pub tx_info: String,
-    pub tx_hash: String,
-    pub message_to_sign: String,
-}
-
-pub const ORDER_TYPE_LIMIT: i32 = 0;
 pub const ORDER_TYPE_MARKET: i32 = 1;
-
 pub const TIF_IOC: i32 = 0;
-pub const TIF_GTT: i32 = 1;
-pub const TIF_POST_ONLY: i32 = 2;
-
 pub const IS_ASK_BUY: i32 = 0;
 pub const IS_ASK_SELL: i32 = 1;
 
@@ -172,7 +163,7 @@ impl LighterSigner {
         trigger_price: i32,
         order_expiry: i64,
         nonce: i64,
-    ) -> Result<SignedTx> {
+    ) -> Result<String> {
         let resp = unsafe {
             (self.sign_create_order)(
                 market_index,
@@ -197,7 +188,10 @@ impl LighterSigner {
         self.consume_response(resp)
     }
 
-    fn consume_response(&self, resp: CSignedTxResponse) -> Result<SignedTx> {
+    /// Drains every Go-allocated string out of the response (so the Go runtime
+    /// can reclaim them) and returns only `tx_info` — the JSON payload we POST
+    /// to /api/v1/sendTx.
+    fn consume_response(&self, resp: CSignedTxResponse) -> Result<String> {
         let take = |p: *mut c_char| -> String {
             if p.is_null() {
                 return String::new();
@@ -208,17 +202,12 @@ impl LighterSigner {
         };
         let err = take(resp.err);
         let tx_info = take(resp.tx_info);
-        let tx_hash = take(resp.tx_hash);
-        let message_to_sign = take(resp.message_to_sign);
+        let _ = take(resp.tx_hash);
+        let _ = take(resp.message_to_sign);
         if !err.is_empty() {
             return Err(eyre!("Lighter SignCreateOrder failed: {err}"));
         }
-        Ok(SignedTx {
-            tx_type: resp.tx_type,
-            tx_info,
-            tx_hash,
-            message_to_sign,
-        })
+        Ok(tx_info)
     }
 }
 

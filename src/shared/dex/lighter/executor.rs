@@ -193,7 +193,7 @@ async fn handle_intent(
                     nonce,
                 )?;
                 let resp = client
-                    .send_tx(TX_TYPE_CREATE_ORDER, &signed.tx_info)
+                    .send_tx(TX_TYPE_CREATE_ORDER, &signed)
                     .await?;
                 if resp.code != 0 && resp.code != 200 {
                     return Err(eyre::eyre!(
@@ -308,7 +308,7 @@ async fn handle_intent(
                     nonce,
                 )?;
                 let resp = client
-                    .send_tx(TX_TYPE_CREATE_ORDER, &signed.tx_info)
+                    .send_tx(TX_TYPE_CREATE_ORDER, &signed)
                     .await?;
                 if resp.code != 0 && resp.code != 200 {
                     return Err(eyre::eyre!(

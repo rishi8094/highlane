@@ -129,8 +129,6 @@ pub struct AccountsByL1Address {
 #[derive(Debug, Deserialize)]
 pub struct SubAccount {
     pub index: i64,
-    #[serde(default)]
-    pub l1_address: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,10 +174,6 @@ struct AccountEnvelope {
     accounts: Vec<AccountDetails>,
     #[serde(default)]
     positions: Vec<AccountPosition>,
-    #[serde(default)]
-    available_balance: Option<String>,
-    #[serde(default)]
-    collateral: Option<String>,
 }
 
 impl AccountEnvelope {
@@ -189,8 +183,6 @@ impl AccountEnvelope {
         }
         AccountDetails {
             positions: self.positions,
-            available_balance: self.available_balance,
-            collateral: self.collateral,
         }
     }
 }
@@ -199,10 +191,6 @@ impl AccountEnvelope {
 pub struct AccountDetails {
     #[serde(default)]
     pub positions: Vec<AccountPosition>,
-    #[serde(default)]
-    pub available_balance: Option<String>,
-    #[serde(default)]
-    pub collateral: Option<String>,
 }
 
 /// Subset of fields we need from AccountPosition. Lighter encodes direction
