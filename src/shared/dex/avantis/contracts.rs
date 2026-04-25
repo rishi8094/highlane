@@ -58,6 +58,46 @@ sol! {
     #[sol(rpc)]
     interface ITradingStorage {
         function callbacks() external view returns (address);
+        function trading() external view returns (address);
+    }
+
+    #[sol(rpc)]
+    interface ITrading {
+        function openTrade(Trade t, uint8 _type, uint256 _slippageP) external;
+        function closeTradeMarket(uint256 _pairIndex, uint256 _index, uint256 _amount) external;
+        function cancelOpenLimitOrder(uint256 _pairIndex, uint256 _index) external;
+        function cancelPendingMarketOrder(uint256 _id) external;
+        function updateOpenLimitOrder(
+            uint256 _pairIndex,
+            uint256 _index,
+            uint256 _price,
+            uint256 _slippageP,
+            uint256 _tp,
+            uint256 _sl
+        ) external;
+        function updateTpAndSl(
+            uint256 _pairIndex,
+            uint256 _index,
+            uint256 _newSl,
+            uint256 _newTP,
+            bytes[] priceUpdateData,
+            uint8 _priceSourcing
+        ) external;
+        function updateSl(
+            uint256 _pairIndex,
+            uint256 _index,
+            uint256 _newSl,
+            bytes[] priceUpdateData,
+            uint8 _priceSourcing
+        ) external;
+        function updateMargin(
+            uint256 _pairIndex,
+            uint256 _index,
+            uint8 _type,
+            uint256 _amount,
+            bytes[] priceUpdateData,
+            uint8 _priceSourcing
+        ) external;
     }
 
     #[sol(rpc)]
