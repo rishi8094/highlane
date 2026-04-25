@@ -45,10 +45,10 @@ fn find_cache_file() -> Option<(std::path::PathBuf, u64)> {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if let Some(ts_str) = name.strip_prefix("pairs-").and_then(|s| s.strip_suffix(".json")) {
-            if let Ok(ts) = ts_str.parse::<u64>() {
-                return Some((entry.path(), ts));
-            }
+        if let Some(ts_str) = name.strip_prefix("pairs-").and_then(|s| s.strip_suffix(".json"))
+            && let Ok(ts) = ts_str.parse::<u64>()
+        {
+            return Some((entry.path(), ts));
         }
     }
     None
