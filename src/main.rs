@@ -29,7 +29,9 @@ async fn main() -> eyre::Result<()> {
         api_key_index: env_or("LIGHTER_API_KEY_INDEX", "0").parse()?,
         api_key_private_hex: std::env::var("LIGHTER_API_KEY_PRIVATE")
             .map_err(|_| eyre::eyre!("LIGHTER_API_KEY_PRIVATE not set"))?,
-        follower_budget_usd: env_or("FOLLOWER_BUDGET_USD", "1000").parse()?,
+        follower_budget_override: std::env::var("FOLLOWER_BUDGET_USD")
+            .ok()
+            .and_then(|s| s.parse().ok()),
         leader_max_exposure_usd: env_or("LEADER_MAX_EXPOSURE_USD", "125000").parse()?,
         dry_run: env_or("LIGHTER_DRY_RUN", "false").eq_ignore_ascii_case("true"),
         slippage_bps: env_or("LIGHTER_SLIPPAGE_BPS", "50").parse()?,

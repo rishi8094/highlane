@@ -174,6 +174,10 @@ struct AccountEnvelope {
     accounts: Vec<AccountDetails>,
     #[serde(default)]
     positions: Vec<AccountPosition>,
+    #[serde(default, alias = "collateral", alias = "total_collateral")]
+    collateral: Option<String>,
+    #[serde(default, alias = "available_balance")]
+    available_balance: Option<String>,
 }
 
 impl AccountEnvelope {
@@ -183,6 +187,8 @@ impl AccountEnvelope {
         }
         AccountDetails {
             positions: self.positions,
+            collateral: self.collateral,
+            available_balance: self.available_balance,
         }
     }
 }
@@ -191,6 +197,26 @@ impl AccountEnvelope {
 pub struct AccountDetails {
     #[serde(default)]
     pub positions: Vec<AccountPosition>,
+    #[serde(default, alias = "total_collateral")]
+    pub collateral: Option<String>,
+    #[serde(default)]
+    pub available_balance: Option<String>,
+}
+
+impl AccountDetails {
+    /// Total USDC collateral on the account (deposited + unrealized PnL minus
+    /// fees). Falls back to `available_balance` if Lighter doesn't return
+    /// `collateral`. Returns `None` if neither field is parseable.
+    pub fn wallet_balance(&self) -> Option<f64> {
+        self.collateral
+            .as_deref()
+            .and_then(|s| s.parse::<f64>().ok())
+            .or_else(|| {
+                self.available_balance
+                    .as_deref()
+                    .and_then(|s| s.parse::<f64>().ok())
+            })
+    }
 }
 
 /// Subset of fields we need from AccountPosition. Lighter encodes direction

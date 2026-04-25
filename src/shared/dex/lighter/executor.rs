@@ -25,7 +25,10 @@ pub struct LighterConfig {
     pub account_index_override: Option<i64>,
     pub api_key_index: i32,
     pub api_key_private_hex: String,
-    pub follower_budget_usd: f64,
+    /// If `Some`, override the live Lighter wallet balance with this value.
+    /// If `None`, the executor reads `collateral` from /api/v1/account at
+    /// startup and uses that as the budget.
+    pub follower_budget_override: Option<f64>,
     pub leader_max_exposure_usd: f64,
     pub dry_run: bool,
     pub slippage_bps: u32,
@@ -60,6 +63,23 @@ pub async fn run(mut rx: mpsc::Receiver<TradeIntent>, cfg: LighterConfig) -> Res
         }
     };
 
+    let follower_budget_usd = match cfg.follower_budget_override {
+        Some(v) => {
+            info!(budget = v, "FOLLOWER_BUDGET_USD override active");
+            v
+        }
+        None => {
+            let det = client.account(account_index).await?;
+            let bal = det.wallet_balance().ok_or_else(|| {
+                eyre::eyre!(
+                    "Lighter /account did not return collateral or available_balance; set FOLLOWER_BUDGET_USD to override"
+                )
+            })?;
+            info!(budget = bal, "using live Lighter wallet balance as budget");
+            bal
+        }
+    };
+
     let markets = load_markets(&client).await?;
     info!(market_count = markets.len(), "Lighter markets ready");
 
@@ -82,7 +102,7 @@ pub async fn run(mut rx: mpsc::Receiver<TradeIntent>, cfg: LighterConfig) -> Res
     info!(
         positions = state.len(),
         dry_run = cfg.dry_run,
-        budget_usd = cfg.follower_budget_usd,
+        budget_usd = follower_budget_usd,
         leader_max_exposure_usd = cfg.leader_max_exposure_usd,
         "executor ready"
     );
@@ -92,7 +112,18 @@ pub async fn run(mut rx: mpsc::Receiver<TradeIntent>, cfg: LighterConfig) -> Res
     }
 
     while let Some(intent) = rx.recv().await {
-        if let Err(e) = handle_intent(&intent, &cfg, &client, signer.as_ref(), &markets, &mut state, account_index).await {
+        if let Err(e) = handle_intent(
+            &intent,
+            &cfg,
+            &client,
+            signer.as_ref(),
+            &markets,
+            &mut state,
+            account_index,
+            follower_budget_usd,
+        )
+        .await
+        {
             error!(error = ?e, leader = %intent.leader(), "intent handling failed");
         }
     }
@@ -109,6 +140,7 @@ async fn handle_intent(
     markets: &HashMap<String, Market>,
     state: &mut CopyState,
     account_index: i64,
+    follower_budget_usd: f64,
 ) -> Result<()> {
     match intent {
         TradeIntent::Open {
@@ -133,7 +165,7 @@ async fn handle_intent(
                 *leader_collateral_usd,
                 *leader_leverage,
                 *leader_exec_price,
-                cfg.follower_budget_usd,
+                follower_budget_usd,
                 cfg.leader_max_exposure_usd,
                 market,
             ) {
