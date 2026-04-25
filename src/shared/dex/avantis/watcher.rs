@@ -9,6 +9,7 @@ use alloy::{
 };
 use eyre::Result;
 use futures_util::StreamExt;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use super::contracts::{
@@ -17,14 +18,15 @@ use super::contracts::{
 };
 use super::format::{format_1e10, format_leverage, format_usdc};
 use super::pairs::load_pair_names;
+use crate::shared::intent::{Side, TradeIntent};
 
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
-pub async fn watch_leader(ws_url: &str, leader: Address) -> ! {
+pub async fn watch_leader(ws_url: &str, leader: Address, tx: mpsc::Sender<TradeIntent>) -> ! {
     let mut backoff = BACKOFF_INITIAL;
     loop {
-        match run_session(ws_url, leader).await {
+        match run_session(ws_url, leader, &tx).await {
             Ok(()) => {
                 warn!("subscription stream ended; reconnecting");
                 backoff = BACKOFF_INITIAL;
@@ -40,7 +42,11 @@ pub async fn watch_leader(ws_url: &str, leader: Address) -> ! {
     }
 }
 
-async fn run_session(ws_url: &str, leader: Address) -> Result<()> {
+async fn run_session(
+    ws_url: &str,
+    leader: Address,
+    tx: &mpsc::Sender<TradeIntent>,
+) -> Result<()> {
     info!(%leader, "connecting to Base WSS");
     let provider = ProviderBuilder::new()
         .connect_ws(WsConnect::new(ws_url.to_string()))
@@ -69,12 +75,17 @@ async fn run_session(ws_url: &str, leader: Address) -> Result<()> {
 
     let mut stream = sub.into_stream();
     while let Some(log) = stream.next().await {
-        handle_log(&log, leader, &pairs);
+        handle_log(&log, leader, &pairs, tx).await;
     }
     Ok(())
 }
 
-fn handle_log(log: &alloy::rpc::types::Log, leader: Address, pairs: &HashMap<u64, String>) {
+async fn handle_log(
+    log: &alloy::rpc::types::Log,
+    leader: Address,
+    pairs: &HashMap<u64, String>,
+    tx: &mpsc::Sender<TradeIntent>,
+) {
     let topic0 = match log.topic0() {
         Some(t) => *t,
         None => return,
@@ -93,24 +104,54 @@ fn handle_log(log: &alloy::rpc::types::Log, leader: Address, pairs: &HashMap<u64
                     return;
                 }
                 let pair_idx: u64 = ev.t.pairIndex.try_into().unwrap_or(u64::MAX);
+                let pos_idx: u64 = ev.t.index.try_into().unwrap_or(u64::MAX);
                 let symbol = pair_name(pairs, pair_idx);
-                let kind = if ev.open { "OPEN" } else { "CLOSE" };
-                let side = if ev.t.buy { "LONG" } else { "SHORT" };
                 let leverage = format_leverage(ev.t.leverage);
                 let collateral = format_usdc(ev.positionSizeUSDC);
-                let notional = collateral * leverage as f64;
-                let mut line = format!(
-                    "[{kind} market] {symbol} {side} collateral=${collateral:.2} pos=${notional:.2} lev={leverage}x execPrice={px:.4} block={block} tx={tx_hash}",
-                    px = format_1e10(ev.price),
-                );
-                if !ev.open {
-                    line.push_str(&format!(
-                        " pnl%={pp:.4} usdcSent=${sent:.2}",
-                        pp = format_pct_1e10(&ev.percentProfit),
-                        sent = format_usdc(ev.usdcSentToTrader),
-                    ));
+                let exec_price = format_1e10(ev.price);
+                let side = if ev.t.buy { Side::Long } else { Side::Short };
+
+                let intent = if ev.open {
+                    info!(
+                        target: "intent",
+                        kind = "OPEN", source = "market", %symbol, %side,
+                        collateral, leverage, exec_price, block, %tx_hash,
+                        "leader OPEN (market)"
+                    );
+                    TradeIntent::Open {
+                        leader,
+                        symbol,
+                        side,
+                        leader_collateral_usd: collateral,
+                        leader_leverage: leverage,
+                        leader_exec_price: exec_price,
+                        leader_pair_index: pair_idx,
+                        leader_position_index: pos_idx,
+                        source_tx: tx_hash.clone(),
+                        source_block: block,
+                    }
+                } else {
+                    let pnl = format_pct_1e10(&ev.percentProfit);
+                    info!(
+                        target: "intent",
+                        kind = "CLOSE", source = "market", %symbol,
+                        exec_price, pnl_pct = pnl, block, %tx_hash,
+                        "leader CLOSE (market)"
+                    );
+                    TradeIntent::Close {
+                        leader,
+                        symbol,
+                        leader_pair_index: pair_idx,
+                        leader_position_index: pos_idx,
+                        leader_exec_price: exec_price,
+                        leader_pnl_pct: pnl,
+                        source_tx: tx_hash.clone(),
+                        source_block: block,
+                    }
+                };
+                if let Err(e) = tx.send(intent).await {
+                    error!(error = ?e, "intent channel closed; executor must have crashed");
                 }
-                println!("{line}");
             }
             Err(e) => warn!(error = ?e, %tx_hash, "failed to decode MarketExecuted"),
         }
@@ -122,25 +163,54 @@ fn handle_log(log: &alloy::rpc::types::Log, leader: Address, pairs: &HashMap<u64
                     return;
                 }
                 let pair_idx: u64 = ev.t.pairIndex.try_into().unwrap_or(u64::MAX);
+                let pos_idx: u64 = ev.t.index.try_into().unwrap_or(u64::MAX);
                 let symbol = pair_name(pairs, pair_idx);
-                let side = if ev.t.buy { "LONG" } else { "SHORT" };
                 let leverage = format_leverage(ev.t.leverage);
                 let collateral = format_usdc(ev.positionSizeUSDC);
-                let notional = collateral * leverage as f64;
-                let kind = if ev.isPnl { "CLOSE" } else { "OPEN" };
-                let mut line = format!(
-                    "[{kind} keeper:{ot}] {symbol} {side} collateral=${collateral:.2} pos=${notional:.2} lev={leverage}x execPrice={px:.4} block={block} tx={tx_hash}",
-                    ot = ev.orderType,
-                    px = format_1e10(ev.price),
-                );
-                if ev.isPnl {
-                    line.push_str(&format!(
-                        " pnl%={pp:.4} usdcSent=${sent:.2}",
-                        pp = format_pct_1e10(&ev.percentProfit),
-                        sent = format_usdc(ev.usdcSentToTrader),
-                    ));
+                let exec_price = format_1e10(ev.price);
+                let side = if ev.t.buy { Side::Long } else { Side::Short };
+
+                let intent = if ev.isPnl {
+                    let pnl = format_pct_1e10(&ev.percentProfit);
+                    info!(
+                        target: "intent",
+                        kind = "CLOSE", source = "keeper", order_type = ev.orderType,
+                        %symbol, exec_price, pnl_pct = pnl, block, %tx_hash,
+                        "leader CLOSE (keeper)"
+                    );
+                    TradeIntent::Close {
+                        leader,
+                        symbol,
+                        leader_pair_index: pair_idx,
+                        leader_position_index: pos_idx,
+                        leader_exec_price: exec_price,
+                        leader_pnl_pct: pnl,
+                        source_tx: tx_hash.clone(),
+                        source_block: block,
+                    }
+                } else {
+                    info!(
+                        target: "intent",
+                        kind = "OPEN", source = "keeper", order_type = ev.orderType,
+                        %symbol, %side, collateral, leverage, exec_price, block, %tx_hash,
+                        "leader OPEN (keeper)"
+                    );
+                    TradeIntent::Open {
+                        leader,
+                        symbol,
+                        side,
+                        leader_collateral_usd: collateral,
+                        leader_leverage: leverage,
+                        leader_exec_price: exec_price,
+                        leader_pair_index: pair_idx,
+                        leader_position_index: pos_idx,
+                        source_tx: tx_hash.clone(),
+                        source_block: block,
+                    }
+                };
+                if let Err(e) = tx.send(intent).await {
+                    error!(error = ?e, "intent channel closed; executor must have crashed");
                 }
-                println!("{line}");
             }
             Err(e) => warn!(error = ?e, %tx_hash, "failed to decode LimitExecuted"),
         }
@@ -157,7 +227,6 @@ fn pair_name(pairs: &HashMap<u64, String>, idx: u64) -> String {
 }
 
 fn format_pct_1e10(raw: &alloy::primitives::I256) -> f64 {
-    // percentProfit is signed, scaled by 1e10
     let s = raw.to_string();
     s.parse::<f64>().unwrap_or(0.0) / 1e10
 }
