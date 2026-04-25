@@ -2,33 +2,24 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use alloy::{
-    primitives::{Address, B256, Bytes},
+    primitives::Address,
     providers::{Provider, ProviderBuilder, WsConnect},
-    sol_types::SolCall,
+    rpc::types::Filter,
+    sol_types::SolEvent,
 };
 use eyre::Result;
 use futures_util::StreamExt;
-use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 
 use super::contracts::{
-    ITrading, ITradingStorage, MULTICALL3, PAIR_STORAGE, TRADING_STORAGE, parse_addr,
+    ICallbacks::{LimitExecuted, MarketExecuted},
+    ITradingStorage, MULTICALL3, PAIR_STORAGE, TRADING_STORAGE, parse_addr,
 };
-use super::format::{format_1e10, format_usdc};
+use super::format::{format_1e10, format_leverage, format_usdc};
 use super::pairs::load_pair_names;
 
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
-
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-struct PendingTx {
-    hash: B256,
-    from: Address,
-    #[serde(default)]
-    to: Option<Address>,
-    input: Bytes,
-}
 
 pub async fn watch_leader(ws_url: &str, leader: Address) -> ! {
     let mut backoff = BACKOFF_INITIAL;
@@ -68,163 +59,93 @@ async fn run_session(ws_url: &str, leader: Address) -> Result<()> {
         });
     info!(count = pairs.len(), "pair names ready");
 
-    let params = (
-        "alchemy_pendingTransactions",
-        serde_json::json!({ "fromAddress": [leader] }),
-    );
-    let sub = provider.subscribe::<_, PendingTx>(params).await?;
-    info!("subscribed to alchemy_pendingTransactions");
+    let filter = Filter::new().address(callbacks_addr).event_signature(vec![
+        <MarketExecuted as SolEvent>::SIGNATURE_HASH,
+        <LimitExecuted as SolEvent>::SIGNATURE_HASH,
+    ]);
+
+    let sub = provider.subscribe_logs(&filter).await?;
+    info!(%callbacks_addr, "subscribed to MarketExecuted + LimitExecuted logs");
 
     let mut stream = sub.into_stream();
-    while let Some(tx) = stream.next().await {
-        handle_tx(&tx, &pairs, trading_addr);
+    while let Some(log) = stream.next().await {
+        handle_log(&log, leader, &pairs);
     }
     Ok(())
 }
 
-fn handle_tx(tx: &PendingTx, pairs: &HashMap<u64, String>, trading_addr: Address) {
-    let data = tx.input.as_ref();
-    if data.len() < 4 {
-        debug!(hash = %tx.hash, "skipping tx with no calldata");
-        return;
-    }
-    let selector: [u8; 4] = data[..4].try_into().unwrap();
-    let to_match = tx
-        .to
-        .map(|a| if a == trading_addr { "trading" } else { "other" })
-        .unwrap_or("none");
+fn handle_log(log: &alloy::rpc::types::Log, leader: Address, pairs: &HashMap<u64, String>) {
+    let topic0 = match log.topic0() {
+        Some(t) => *t,
+        None => return,
+    };
+    let tx_hash = log
+        .transaction_hash
+        .map(|h| h.to_string())
+        .unwrap_or_else(|| "?".into());
+    let block = log.block_number.unwrap_or_default();
 
-    match selector {
-        s if s == <ITrading::openTradeCall as SolCall>::SELECTOR => {
-            match <ITrading::openTradeCall as SolCall>::abi_decode(data) {
-                Ok(call) => {
-                    let t = call.t;
-                    let pair_idx: u64 = t.pairIndex.try_into().unwrap_or(u64::MAX);
-                    let symbol = pair_name(pairs, pair_idx);
-                    let side = if t.buy { "LONG" } else { "SHORT" };
-                    let leverage: u128 = t.leverage.try_into().unwrap_or(0);
-                    println!(
-                        "[OPEN] {symbol} {side} size=${:.2} lev={lev}x price={:.4} tp={:.4} sl={:.4} orderType={ot} slippageP={sp} tx={hash} to={to}",
-                        format_usdc(t.positionSizeUSDC),
-                        format_1e10(t.openPrice),
-                        format_1e10(t.tp),
-                        format_1e10(t.sl),
-                        lev = leverage,
-                        ot = call._type,
-                        sp = call._slippageP,
-                        hash = tx.hash,
-                        to = to_match,
-                    );
+    if topic0 == <MarketExecuted as SolEvent>::SIGNATURE_HASH {
+        match <MarketExecuted as SolEvent>::decode_log(&log.inner) {
+            Ok(decoded) => {
+                let ev = &decoded.data;
+                if ev.t.trader != leader {
+                    return;
                 }
-                Err(e) => warn!(hash = %tx.hash, error = ?e, "failed to decode openTrade"),
-            }
-        }
-        s if s == <ITrading::closeTradeMarketCall as SolCall>::SELECTOR => {
-            match <ITrading::closeTradeMarketCall as SolCall>::abi_decode(data) {
-                Ok(call) => {
-                    let pair_idx: u64 = call._pairIndex.try_into().unwrap_or(u64::MAX);
-                    println!(
-                        "[CLOSE market] {} idx={} amount={} tx={} to={to_match}",
-                        pair_name(pairs, pair_idx),
-                        call._index,
-                        call._amount,
-                        tx.hash,
-                    );
-                }
-                Err(e) => warn!(hash = %tx.hash, error = ?e, "failed to decode closeTradeMarket"),
-            }
-        }
-        s if s == <ITrading::cancelOpenLimitOrderCall as SolCall>::SELECTOR => {
-            match <ITrading::cancelOpenLimitOrderCall as SolCall>::abi_decode(data) {
-                Ok(call) => {
-                    let pair_idx: u64 = call._pairIndex.try_into().unwrap_or(u64::MAX);
-                    println!(
-                        "[CLOSE cancel-limit] {} idx={} tx={} to={to_match}",
-                        pair_name(pairs, pair_idx),
-                        call._index,
-                        tx.hash,
-                    );
-                }
-                Err(e) => {
-                    warn!(hash = %tx.hash, error = ?e, "failed to decode cancelOpenLimitOrder")
-                }
-            }
-        }
-        s if s == <ITrading::cancelPendingMarketOrderCall as SolCall>::SELECTOR => {
-            match <ITrading::cancelPendingMarketOrderCall as SolCall>::abi_decode(data) {
-                Ok(call) => {
-                    println!(
-                        "[CANCEL pending-market] orderId={} tx={} to={to_match}",
-                        call._id, tx.hash,
-                    );
-                }
-                Err(e) => {
-                    warn!(hash = %tx.hash, error = ?e, "failed to decode cancelPendingMarketOrder")
-                }
-            }
-        }
-        s if s == <ITrading::updateOpenLimitOrderCall as SolCall>::SELECTOR => {
-            if let Ok(call) = <ITrading::updateOpenLimitOrderCall as SolCall>::abi_decode(data) {
-                let pair_idx: u64 = call._pairIndex.try_into().unwrap_or(u64::MAX);
-                println!(
-                    "[MODIFY limit] {} idx={} price={:.4} tp={:.4} sl={:.4} slippageP={} tx={} to={to_match}",
-                    pair_name(pairs, pair_idx),
-                    call._index,
-                    format_1e10(call._price),
-                    format_1e10(call._tp),
-                    format_1e10(call._sl),
-                    call._slippageP,
-                    tx.hash,
+                let pair_idx: u64 = ev.t.pairIndex.try_into().unwrap_or(u64::MAX);
+                let symbol = pair_name(pairs, pair_idx);
+                let kind = if ev.open { "OPEN" } else { "CLOSE" };
+                let side = if ev.t.buy { "LONG" } else { "SHORT" };
+                let leverage = format_leverage(ev.t.leverage);
+                let collateral = format_usdc(ev.positionSizeUSDC);
+                let notional = collateral * leverage as f64;
+                let mut line = format!(
+                    "[{kind} market] {symbol} {side} collateral=${collateral:.2} pos=${notional:.2} lev={leverage}x execPrice={px:.4} block={block} tx={tx_hash}",
+                    px = format_1e10(ev.price),
                 );
+                if !ev.open {
+                    line.push_str(&format!(
+                        " pnl%={pp:.4} usdcSent=${sent:.2}",
+                        pp = format_pct_1e10(&ev.percentProfit),
+                        sent = format_usdc(ev.usdcSentToTrader),
+                    ));
+                }
+                println!("{line}");
             }
+            Err(e) => warn!(error = ?e, %tx_hash, "failed to decode MarketExecuted"),
         }
-        s if s == <ITrading::updateTpAndSlCall as SolCall>::SELECTOR => {
-            if let Ok(call) = <ITrading::updateTpAndSlCall as SolCall>::abi_decode(data) {
-                let pair_idx: u64 = call._pairIndex.try_into().unwrap_or(u64::MAX);
-                println!(
-                    "[MODIFY tp/sl] {} idx={} newSl={:.4} newTp={:.4} tx={} to={to_match}",
-                    pair_name(pairs, pair_idx),
-                    call._index,
-                    format_1e10(call._newSl),
-                    format_1e10(call._newTP),
-                    tx.hash,
+    } else if topic0 == <LimitExecuted as SolEvent>::SIGNATURE_HASH {
+        match <LimitExecuted as SolEvent>::decode_log(&log.inner) {
+            Ok(decoded) => {
+                let ev = &decoded.data;
+                if ev.t.trader != leader {
+                    return;
+                }
+                let pair_idx: u64 = ev.t.pairIndex.try_into().unwrap_or(u64::MAX);
+                let symbol = pair_name(pairs, pair_idx);
+                let side = if ev.t.buy { "LONG" } else { "SHORT" };
+                let leverage = format_leverage(ev.t.leverage);
+                let collateral = format_usdc(ev.positionSizeUSDC);
+                let notional = collateral * leverage as f64;
+                let kind = if ev.isPnl { "CLOSE" } else { "OPEN" };
+                let mut line = format!(
+                    "[{kind} keeper:{ot}] {symbol} {side} collateral=${collateral:.2} pos=${notional:.2} lev={leverage}x execPrice={px:.4} block={block} tx={tx_hash}",
+                    ot = ev.orderType,
+                    px = format_1e10(ev.price),
                 );
+                if ev.isPnl {
+                    line.push_str(&format!(
+                        " pnl%={pp:.4} usdcSent=${sent:.2}",
+                        pp = format_pct_1e10(&ev.percentProfit),
+                        sent = format_usdc(ev.usdcSentToTrader),
+                    ));
+                }
+                println!("{line}");
             }
+            Err(e) => warn!(error = ?e, %tx_hash, "failed to decode LimitExecuted"),
         }
-        s if s == <ITrading::updateSlCall as SolCall>::SELECTOR => {
-            if let Ok(call) = <ITrading::updateSlCall as SolCall>::abi_decode(data) {
-                let pair_idx: u64 = call._pairIndex.try_into().unwrap_or(u64::MAX);
-                println!(
-                    "[MODIFY sl] {} idx={} newSl={:.4} tx={} to={to_match}",
-                    pair_name(pairs, pair_idx),
-                    call._index,
-                    format_1e10(call._newSl),
-                    tx.hash,
-                );
-            }
-        }
-        s if s == <ITrading::updateMarginCall as SolCall>::SELECTOR => {
-            if let Ok(call) = <ITrading::updateMarginCall as SolCall>::abi_decode(data) {
-                let pair_idx: u64 = call._pairIndex.try_into().unwrap_or(u64::MAX);
-                println!(
-                    "[MODIFY margin] {} idx={} type={} amount={} tx={} to={to_match}",
-                    pair_name(pairs, pair_idx),
-                    call._index,
-                    call._type,
-                    call._amount,
-                    tx.hash,
-                );
-            }
-        }
-        _ => {
-            debug!(
-                hash = %tx.hash,
-                from = %tx.from,
-                to = ?tx.to,
-                selector = format!("0x{}", hex_short(&selector)),
-                "unrecognized selector from leader",
-            );
-        }
+    } else {
+        debug!(%topic0, %tx_hash, "log with unexpected topic0");
     }
 }
 
@@ -235,6 +156,8 @@ fn pair_name(pairs: &HashMap<u64, String>, idx: u64) -> String {
         .unwrap_or_else(|| format!("#{idx}"))
 }
 
-fn hex_short(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+fn format_pct_1e10(raw: &alloy::primitives::I256) -> f64 {
+    // percentProfit is signed, scaled by 1e10
+    let s = raw.to_string();
+    s.parse::<f64>().unwrap_or(0.0) / 1e10
 }
