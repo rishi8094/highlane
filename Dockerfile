@@ -13,9 +13,13 @@ RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
 RUN cargo build --release --bin highlane
 
-# We do not need the Rust toolchain to run the binary!
 FROM debian:trixie-slim AS runtime
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 libpq5 && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
+COPY tools/fetch_lighter_signer.sh /app/tools/fetch_lighter_signer.sh
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates curl libssl3 libpq5 && \
+    /app/tools/fetch_lighter_signer.sh && \
+    apt-get purge -y --auto-remove curl && \
+    rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/highlane /usr/local/bin
 ENTRYPOINT ["/usr/local/bin/highlane"]
