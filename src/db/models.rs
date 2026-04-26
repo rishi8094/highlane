@@ -34,7 +34,7 @@ pub struct Trade {
     pub id: i32,
     pub market_id: i32,
     pub side: Side,
-    pub base_amount: i64,
+    pub size: i64,
 }
 
 #[derive(Debug, Insertable)]
@@ -45,7 +45,7 @@ pub struct NewTrade<'a> {
     pub market_id: i32,
     pub symbol_id: i32,
     pub side: Side,
-    pub base_amount: i64,
+    pub size: i64,
     pub entry_collateral_usd: Option<f64>,
     pub entry_leverage: Option<i32>,
     pub entry_price: Option<f64>,

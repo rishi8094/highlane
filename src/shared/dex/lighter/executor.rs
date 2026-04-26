@@ -222,7 +222,7 @@ async fn handle_intent(
             info!(
                 target: "execute",
                 symbol = %symbol, side = %side, %market.market_id,
-                base_amount = sized.base_amount_int,
+                size = sized.base_amount_int,
                 price = price_int,
                 target_collateral = sized.target_collateral_usd,
                 target_leverage = sized.target_leverage,
@@ -369,7 +369,7 @@ async fn handle_intent(
             info!(
                 target: "execute",
                 symbol = %symbol, side = %close_side, market_id = open.market_id,
-                base_amount = open.base_amount, price = price_int,
+                size = open.size, price = price_int,
                 "sending Lighter market IOC CLOSE (reduce-only)"
             );
 
@@ -380,7 +380,7 @@ async fn handle_intent(
                 let signed = signer.sign_create_order(
                     open.market_id,
                     client_order_id(),
-                    open.base_amount,
+                    open.size,
                     price_int,
                     is_ask,
                     ORDER_TYPE_MARKET,
@@ -449,8 +449,8 @@ async fn reconcile_on_startup(
     let mut state_by_market: HashMap<i32, i64> = HashMap::new();
     for t in open_trades {
         let signed: i64 = match t.side {
-            Side::Long => t.base_amount,
-            Side::Short => -t.base_amount,
+            Side::Long => t.size,
+            Side::Short => -t.size,
         };
         *state_by_market.entry(t.market_id).or_default() += signed;
     }

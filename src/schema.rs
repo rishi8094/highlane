@@ -70,7 +70,7 @@ diesel::table! {
         market_id -> Int4,
         symbol_id -> Int4,
         side -> TradeSide,
-        base_amount -> Int8,
+        size -> Int8,
         entry_collateral_usd -> Nullable<Float8>,
         entry_leverage -> Nullable<Int4>,
         entry_price -> Nullable<Float8>,
