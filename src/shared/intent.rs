@@ -45,6 +45,10 @@ pub enum TradeIntent {
         symbol: String,
         leader_pair_index: u64,
         leader_position_index: u64,
+        /// Price at which the leader's close executed on Avantis (1e10-scaled
+        /// → human float). Used to bound our reduce-only IOC on Lighter so the
+        /// signer doesn't reject `price=0`.
+        leader_exec_price: f64,
     },
 }
 

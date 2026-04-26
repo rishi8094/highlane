@@ -143,6 +143,7 @@ async fn handle_log(
                         symbol,
                         leader_pair_index: pair_idx,
                         leader_position_index: pos_idx,
+                        leader_exec_price: exec_price,
                     }
                 };
                 if let Err(e) = tx.send(intent).await {
@@ -179,6 +180,7 @@ async fn handle_log(
                         symbol,
                         leader_pair_index: pair_idx,
                         leader_position_index: pos_idx,
+                        leader_exec_price: exec_price,
                     }
                 } else {
                     info!(

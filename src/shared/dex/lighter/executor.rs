@@ -310,7 +310,7 @@ async fn handle_intent(
             symbol,
             leader_pair_index,
             leader_position_index,
-            ..
+            leader_exec_price,
         } => {
             let key = (*leader, *leader_pair_index, *leader_position_index);
             let Some(open) = state.get(&key).cloned() else {
@@ -320,22 +320,43 @@ async fn handle_intent(
                 );
                 return Ok(());
             };
+            let Some(market) = markets.values().find(|m| m.market_id == open.market_id) else {
+                warn!(
+                    %symbol, market_id = open.market_id,
+                    "market metadata missing on CLOSE — skipping"
+                );
+                return Ok(());
+            };
 
-            // Reduce-only counter-side IOC market
+            // Reduce-only counter-side IOC market.
             let close_side = open.side.flip();
             let is_ask = match close_side {
                 Side::Long => IS_ASK_BUY,
                 Side::Short => IS_ASK_SELL,
             };
-            // For close we don't have a great reference price; we use price=0 with
-            // price_protection=true so Lighter applies its own bound. Many Lighter
-            // SDK examples send price=0 for IOC market reduce-only.
-            let price_int = 0;
+            // Lighter rejects price=0 with "OrderPrice should not be less than 1".
+            // Use the leader's close exec price as a reference and bias by
+            // slippage_bps in the *order* direction (close LONG = SELL needs a
+            // lower bound; close SHORT = BUY needs an upper bound) so the IOC
+            // crosses. price_with_slippage already encodes this convention.
+            let price_int = price_with_slippage(
+                *leader_exec_price,
+                cfg.slippage_bps,
+                close_side,
+                market.price_decimals,
+            );
+            if price_int < 1 {
+                warn!(
+                    %symbol, market_id = open.market_id, leader_exec_price,
+                    "computed CLOSE price < 1 (bad leader exec price?) — skipping"
+                );
+                return Ok(());
+            }
 
             info!(
                 target: "execute",
                 symbol = %symbol, side = %close_side, market_id = open.market_id,
-                base_amount = open.base_amount,
+                base_amount = open.base_amount, price = price_int,
                 "sending Lighter market IOC CLOSE (reduce-only)"
             );
 
