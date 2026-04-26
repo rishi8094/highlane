@@ -1,22 +1,19 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use diesel::Connection;
 use diesel::pg::PgConnection;
 use diesel_async::AsyncPgConnection;
+use diesel_async::pooled_connection::{AsyncDieselConnectionManager, ManagerConfig};
+use diesel_async::pooled_connection::bb8::Pool;
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use eyre::{Context, Result};
 use rustls::{ClientConfig, RootCertStore};
-use tokio::sync::Mutex;
 use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::{error, info};
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
-/// Single shared async Postgres connection. Single-machine deployment, so
-/// pooling adds no throughput. Calls serialize through the mutex; given the
-/// bot's <1 query/sec rate this is fine.
-pub type DbPool = Arc<Mutex<AsyncPgConnection>>;
+pub type DbPool = Pool<AsyncPgConnection>;
 
 pub async fn init() -> Result<DbPool> {
     // rustls 0.23 requires the process-wide CryptoProvider to be installed
@@ -29,34 +26,28 @@ pub async fn init() -> Result<DbPool> {
 
     run_migrations(&url).context("running embedded migrations")?;
 
-    info!("opening async postgres connection (15s budget)");
-    let conn = match tokio::time::timeout(Duration::from_secs(15), establish_tls(url)).await {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => return Err(eyre::eyre!("async postgres connect failed: {e}")),
-        Err(_) => {
-            return Err(eyre::eyre!(
-                "async postgres connect timed out after 15s — check sslmode= in DATABASE_URL \
-                 or whether tokio resolves the host differently than libpq."
-            ));
-        }
-    };
-    info!("postgres connection ready");
-    Ok(Arc::new(Mutex::new(conn)))
+    let mut mgr_cfg: ManagerConfig<AsyncPgConnection> = ManagerConfig::default();
+    mgr_cfg.custom_setup = Box::new(|url| Box::pin(establish_tls(url.to_string())));
+    let manager =
+        AsyncDieselConnectionManager::<AsyncPgConnection>::new_with_config(url, mgr_cfg);
+    let pool = Pool::builder()
+        .max_size(8)
+        .build(manager)
+        .await
+        .context("building Postgres pool")?;
+    info!("postgres pool ready");
+    Ok(pool)
 }
 
 /// Establish a tokio-postgres connection over rustls and hand it to
 /// diesel-async. tokio-postgres has no built-in TLS — without this, any
-/// server that requires SSL (e.g. Fly Postgres) hangs the handshake.
+/// server that requires SSL (e.g. Fly Postgres) will hang the handshake
+/// until bb8's connection_timeout fires.
 async fn establish_tls(url: String) -> diesel::ConnectionResult<AsyncPgConnection> {
-    info!("establish_tls: tokio_postgres::connect starting");
     let tls = MakeRustlsConnect::new((*tls_config()).clone());
     let (client, conn) = tokio_postgres::connect(&url, tls)
         .await
-        .map_err(|e| {
-            error!(error = %e, "tokio_postgres::connect failed");
-            diesel::ConnectionError::BadConnection(e.to_string())
-        })?;
-    info!("establish_tls: tokio_postgres::connect ok");
+        .map_err(|e| diesel::ConnectionError::BadConnection(e.to_string()))?;
     tokio::spawn(async move {
         if let Err(e) = conn.await {
             error!(error = ?e, "postgres connection driver error");

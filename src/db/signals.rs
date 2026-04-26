@@ -26,7 +26,7 @@ pub async fn record_open(
     entry_tx: &str,
     entry_block: i64,
 ) -> Result<i32> {
-    let mut conn = pool.lock().await;
+    let mut conn = pool.get().await?;
     let new = NewSignal {
         trader_id,
         source_dex,
@@ -50,7 +50,7 @@ pub async fn record_open(
         .do_update()
         .set(signals::trader_id.eq(trader_id))
         .returning(signals::id)
-        .get_result(&mut *conn)
+        .get_result(&mut conn)
         .await?;
     Ok(id)
 }
@@ -67,7 +67,7 @@ pub async fn record_close(
     exit_tx: &str,
     exit_block: i64,
 ) -> Result<Option<i32>> {
-    let mut conn = pool.lock().await;
+    let mut conn = pool.get().await?;
     let now = Utc::now();
     let id: Option<i32> = diesel::update(
         signals::table
@@ -83,7 +83,7 @@ pub async fn record_close(
         signals::exit_at.eq(Some(now)),
     ))
     .returning(signals::id)
-    .get_result(&mut *conn)
+    .get_result(&mut conn)
     .await
     .optional()?;
     Ok(id)

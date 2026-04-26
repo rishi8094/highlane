@@ -24,7 +24,7 @@ pub async fn record_open(
     entry_tx: Option<&str>,
     entry_block: Option<i64>,
 ) -> Result<i32> {
-    let mut conn = pool.lock().await;
+    let mut conn = pool.get().await?;
     let new = NewTrade {
         signal_id,
         target_dex,
@@ -41,7 +41,7 @@ pub async fn record_open(
     let id: i32 = diesel::insert_into(trades::table)
         .values(&new)
         .returning(trades::id)
-        .get_result(&mut *conn)
+        .get_result(&mut conn)
         .await?;
     Ok(id)
 }
@@ -49,13 +49,13 @@ pub async fn record_open(
 /// Look up the most recent open trade for a given signal. There should be at
 /// most one; if there's drift we still take the newest.
 pub async fn find_open_for_signal(pool: &DbPool, signal_id: i32) -> Result<Option<Trade>> {
-    let mut conn = pool.lock().await;
+    let mut conn = pool.get().await?;
     let row = trades::table
         .filter(trades::signal_id.eq(signal_id))
         .filter(trades::exit_at.is_null())
         .order(trades::id.desc())
         .select(Trade::as_select())
-        .first(&mut *conn)
+        .first(&mut conn)
         .await
         .optional()?;
     Ok(row)
@@ -68,7 +68,7 @@ pub async fn record_close(
     exit_price: Option<f64>,
     exit_tx: Option<&str>,
 ) -> Result<()> {
-    let mut conn = pool.lock().await;
+    let mut conn = pool.get().await?;
     let now = Utc::now();
     diesel::update(
         trades::table
@@ -80,7 +80,7 @@ pub async fn record_close(
         trades::exit_tx.eq(exit_tx),
         trades::exit_at.eq(Some(now)),
     ))
-    .execute(&mut *conn)
+    .execute(&mut conn)
     .await?;
     Ok(())
 }
@@ -89,12 +89,12 @@ pub async fn record_close(
 /// Used by the executor's startup reconciliation against live exchange
 /// positions.
 pub async fn list_open_for_target(pool: &DbPool, target_dex: Dex) -> Result<Vec<Trade>> {
-    let mut conn = pool.lock().await;
+    let mut conn = pool.get().await?;
     let rows = trades::table
         .filter(trades::exit_at.is_null())
         .filter(trades::target_dex.eq(target_dex))
         .select(Trade::as_select())
-        .load(&mut *conn)
+        .load(&mut conn)
         .await?;
     Ok(rows)
 }
@@ -109,7 +109,7 @@ pub async fn fail_open_for_market(
     target_dex: Dex,
     market_id: i32,
 ) -> Result<usize> {
-    let mut conn = pool.lock().await;
+    let mut conn = pool.get().await?;
     let now = Utc::now();
     let n = diesel::update(
         trades::table
@@ -118,7 +118,7 @@ pub async fn fail_open_for_market(
             .filter(trades::market_id.eq(market_id)),
     )
     .set(trades::exit_at.eq(Some(now)))
-    .execute(&mut *conn)
+    .execute(&mut conn)
     .await?;
     Ok(n)
 }

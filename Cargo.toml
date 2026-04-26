@@ -16,9 +16,10 @@ libloading = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 hex = "0.4"
 diesel = { version = "2.3.8", features = ["postgres", "chrono", "64-column-tables"] }
-diesel-async = { version = "0.7", features = ["postgres"] }
+diesel-async = { version = "0.7", features = ["postgres", "bb8"] }
 diesel_migrations = { version = "2.3", features = ["postgres"] }
 diesel-derive-enum = { version = "2.1", features = ["postgres"] }
+bb8 = "0.9"
 chrono = { version = "0.4", features = ["serde"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-postgres = "0.7"

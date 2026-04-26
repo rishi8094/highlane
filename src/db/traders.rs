@@ -14,7 +14,7 @@ pub async fn upsert_trader(
     wallet_address: &str,
     source_dex: Dex,
 ) -> Result<i32> {
-    let mut conn = pool.lock().await;
+    let mut conn = pool.get().await?;
     let new = NewTrader {
         wallet_address,
         source_dex,
@@ -25,7 +25,7 @@ pub async fn upsert_trader(
         .do_update()
         .set(traders::wallet_address.eq(wallet_address))
         .returning(traders::id)
-        .get_result(&mut *conn)
+        .get_result(&mut conn)
         .await?;
     Ok(id)
 }
