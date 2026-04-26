@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
+use tracing::{info, warn};
 
 use super::contracts::{IBatchCall, IPairStorage};
 
@@ -26,7 +27,7 @@ pub async fn load_pair_names(
     multicall3_addr: Address,
 ) -> Result<HashMap<u64, String>> {
     if let Some(cached) = read_cache() {
-        println!("Loaded {} pairs from cache", cached.len());
+        info!(count = cached.len(), "loaded Avantis pairs from cache");
         return Ok(cached);
     }
 
@@ -127,8 +128,8 @@ async fn fetch_pair_names(
     let multicall = IBatchCall::new(multicall3_addr, provider);
     let results: Vec<IBatchCall::Result3> = multicall.aggregate3(calls).call().await?;
 
+    info!(count, "fetching Avantis pairs from chain");
     let mut pair_names = HashMap::new();
-    println!("Fetching {} pairs from chain...", count);
     for (i, result) in results.iter().enumerate() {
         if result.success {
             if let Ok(data) =
@@ -138,7 +139,7 @@ async fn fetch_pair_names(
                 pair_names.insert(i as u64, name);
             }
         } else {
-            eprintln!("  Failed to load pair {}", i);
+            warn!(pair_index = i, "failed to load Avantis pair");
         }
     }
 
