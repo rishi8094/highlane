@@ -48,18 +48,27 @@ pub async fn run(mut rx: mpsc::Receiver<TradeIntent>, cfg: LighterConfig) -> Res
             let resp = client
                 .accounts_by_l1_address(&cfg.l1_address)
                 .await?;
-            let idx = resp
+            // Prefer account_type=0 (main cross account) over system slots.
+            let chosen = resp
                 .sub_accounts
-                .first()
+                .iter()
+                .find(|a| a.account_type == 0)
+                .or_else(|| resp.sub_accounts.first())
                 .ok_or_else(|| {
                     eyre::eyre!(
-                        "no Lighter account found for L1 address {}",
+                        "no Lighter sub-account found for L1 address {}",
                         cfg.l1_address
                     )
-                })?
-                .index;
-            info!(l1_address = %cfg.l1_address, account_index = idx, "resolved Lighter account");
-            idx
+                })?;
+            info!(
+                l1_address = %cfg.l1_address,
+                account_index = chosen.index,
+                account_type = chosen.account_type,
+                collateral = chosen.collateral.as_deref().unwrap_or("?"),
+                sub_account_count = resp.sub_accounts.len(),
+                "resolved Lighter account"
+            );
+            chosen.index
         }
     };
 
@@ -75,7 +84,15 @@ pub async fn run(mut rx: mpsc::Receiver<TradeIntent>, cfg: LighterConfig) -> Res
                     "Lighter /account did not return collateral or available_balance; set FOLLOWER_BUDGET_USD to override"
                 )
             })?;
-            info!(budget = bal, "using live Lighter wallet balance as budget");
+            if bal <= 0.0 {
+                return Err(eyre::eyre!(
+                    "Lighter account_index={account_index} reports {bal} collateral. Either the account is empty, you are pointing at the wrong sub-account (check LIGHTER_ACCOUNT_INDEX), or set FOLLOWER_BUDGET_USD to override."
+                ));
+            }
+            info!(
+                account_index, budget = bal,
+                "using live Lighter wallet balance as budget"
+            );
             bal
         }
     };
@@ -444,12 +461,16 @@ async fn reconcile_on_startup(
     Ok(())
 }
 
+/// Lighter caps `client_order_index` at 2^48 - 1 (`281_474_976_710_655`).
+/// Milliseconds since epoch is ~1.78e12 → fits with ~159× headroom and stays
+/// valid for thousands of years. Same-ms collisions are theoretically possible
+/// but unlikely given our 750ms post-fill snapshot delay.
 fn client_order_id() -> i64 {
-    let nanos = SystemTime::now()
+    let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
+        .map(|d| d.as_millis())
         .unwrap_or(0);
-    (nanos as i64) & i64::MAX
+    (ms as i64) & ((1_i64 << 48) - 1)
 }
 
 fn price_with_slippage(exec: f64, slippage_bps: u32, side: Side, price_decimals: i32) -> i32 {

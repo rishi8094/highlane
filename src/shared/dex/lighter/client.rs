@@ -129,6 +129,11 @@ pub struct AccountsByL1Address {
 #[derive(Debug, Deserialize)]
 pub struct SubAccount {
     pub index: i64,
+    /// 0 = main cross account, 3 = system / special slot. Prefer 0.
+    #[serde(default)]
+    pub account_type: i32,
+    #[serde(default)]
+    pub collateral: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,31 +144,32 @@ struct NextNonceResp {
 
 #[derive(Debug, Deserialize)]
 pub struct OrderBookDetailsResp {
-    #[serde(default, alias = "perp_order_book_details")]
-    pub perp: Vec<PerpsOrderBookDetail>,
+    #[serde(default)]
+    pub order_book_details: Vec<PerpsOrderBookDetail>,
 }
 
-/// Subset of fields we need from PerpsOrderBookDetail. Lighter returns more —
-/// we pull only what we use and let the rest deserialize by ignoring unknowns.
+/// Subset of fields we need from a Lighter perp orderbook entry.
+/// Margin fractions are encoded in basis points × 0.01% (so `400` means
+/// 4% initial margin → 25x max leverage). We derive max_leverage from
+/// `min_initial_margin_fraction` (preferred) or fall back to default.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct PerpsOrderBookDetail {
     pub market_id: i32,
     pub symbol: String,
-    /// Decimals scale for base amount (e.g. 4 means 1 unit = 1e-4 BASE)
-    #[serde(default, alias = "size_decimals")]
+    #[serde(default)]
+    pub market_type: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
     pub size_decimals: i32,
-    /// Decimals scale for price (e.g. 2 means 1 unit = 1e-2 USD)
-    #[serde(default, alias = "price_decimals")]
+    #[serde(default)]
     pub price_decimals: i32,
-    /// Min order size in base units (e.g. "0.001")
-    #[serde(default, alias = "min_base_amount")]
+    #[serde(default)]
     pub min_base_amount: Option<String>,
-    /// Max leverage (e.g. 50)
-    #[serde(default, alias = "max_leverage")]
-    pub max_leverage: Option<f64>,
-    /// Initial margin fraction (1/leverage). If max_leverage missing we derive from this.
-    #[serde(default, alias = "initial_margin_fraction")]
-    pub initial_margin_fraction: Option<f64>,
+    #[serde(default)]
+    pub min_initial_margin_fraction: Option<i32>,
+    #[serde(default)]
+    pub default_initial_margin_fraction: Option<i32>,
 }
 
 /// Lighter wraps the account either as { code, accounts: [...] } or returns it

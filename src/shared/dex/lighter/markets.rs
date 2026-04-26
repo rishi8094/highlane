@@ -45,31 +45,39 @@ pub async fn load_markets(client: &LighterClient) -> Result<HashMap<String, Mark
 
 async fn fetch(client: &LighterClient) -> Result<HashMap<String, Market>> {
     let resp = client.order_book_details().await?;
+    let total = resp.order_book_details.len();
     let mut out = HashMap::new();
-    for d in resp.perp {
+    for d in resp.order_book_details {
         if let Some(m) = parse_market(&d) {
             out.insert(symbol_root(&m.symbol), m);
         } else {
-            warn!(symbol = %d.symbol, "skipping market with incomplete metadata");
+            warn!(symbol = %d.symbol, status = %d.status, "skipping market");
         }
+    }
+    if out.is_empty() {
+        return Err(eyre::eyre!(
+            "Lighter orderBookDetails returned 0 usable perp markets (raw count {total}); API shape may have changed"
+        ));
     }
     info!(count = out.len(), "fetched Lighter perp markets");
     Ok(out)
 }
 
 fn parse_market(d: &PerpsOrderBookDetail) -> Option<Market> {
+    if d.status != "active" {
+        return None;
+    }
+    let imf = d
+        .min_initial_margin_fraction
+        .or(d.default_initial_margin_fraction)
+        .filter(|&v| v > 0)?;
+    // imf is in basis points × 0.01% (e.g. 400 = 4% margin = 25x leverage).
+    let max_lev = (10_000_i64 / imf as i64) as u64;
     let min_base = d
         .min_base_amount
         .as_deref()
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.0);
-    let max_lev = d
-        .max_leverage
-        .or_else(|| d.initial_margin_fraction.map(|imf| {
-            if imf > 0.0 { 1.0 / imf } else { 0.0 }
-        }))
-        .map(|x| x.round() as u64)
-        .unwrap_or(0);
     if d.size_decimals < 0 || d.price_decimals < 0 || max_lev == 0 {
         return None;
     }
@@ -124,10 +132,17 @@ fn read_cache() -> Option<HashMap<String, Market>> {
     }
     let data = std::fs::read_to_string(&path).ok()?;
     let cache: MarketsCache = serde_json::from_str(&data).ok()?;
+    if cache.markets.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
     Some(cache.markets)
 }
 
 fn write_cache(markets: &HashMap<String, Market>) {
+    if markets.is_empty() {
+        return;
+    }
     let _ = std::fs::create_dir_all(CACHE_DIR);
     if let Ok(entries) = std::fs::read_dir(CACHE_DIR) {
         for entry in entries.flatten() {
