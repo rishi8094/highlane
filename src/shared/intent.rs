@@ -1,8 +1,9 @@
 use alloy::primitives::Address;
-use serde::{Deserialize, Serialize};
+use diesel_derive_enum::DbEnum;
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, DbEnum)]
+#[ExistingTypePath = "crate::schema::sql_types::TradeSide"]
 pub enum Side {
     Long,
     Short,
@@ -35,10 +36,10 @@ pub enum TradeIntent {
         leader_collateral_usd: f64,
         leader_leverage: u64,
         leader_exec_price: f64,
-        leader_pair_index: u64,
-        leader_position_index: u64,
         source_tx: String,
         source_block: u64,
+        signal_id: i32,
+        symbol_id: i32,
     },
     Close {
         leader: Address,
@@ -49,6 +50,7 @@ pub enum TradeIntent {
         /// → human float). Used to bound our reduce-only IOC on Lighter so the
         /// signer doesn't reject `price=0`.
         leader_exec_price: f64,
+        signal_id: i32,
     },
 }
 

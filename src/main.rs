@@ -1,5 +1,8 @@
+mod db;
+mod schema;
 mod shared;
 
+use shared::dex::Dex;
 use shared::dex::avantis::{contracts::parse_addr, watcher};
 use shared::dex::lighter::executor::{LighterConfig, run as run_executor};
 use shared::intent::TradeIntent;
@@ -17,6 +20,11 @@ async fn main() -> eyre::Result<()> {
     let ws_url = std::env::var("BASE_WSS_URL")
         .map_err(|_| eyre::eyre!("BASE_WSS_URL not set (run via `doppler run -- cargo run`)"))?;
     let leader = parse_addr("0x3b514bCDd2E96af48374c3D2ca42736a2393212F");
+
+    let pool = db::init().await?;
+    let leader_lower = format!("{:#x}", leader);
+    let trader_id = db::traders::upsert_trader(&pool, &leader_lower, Dex::Avantis).await?;
+    tracing::info!(trader_id, leader = %leader_lower, "trader registered");
 
     let cfg = LighterConfig {
         base_url: env_or("LIGHTER_BASE_URL", "https://mainnet.zklighter.elliot.ai"),
@@ -39,12 +47,13 @@ async fn main() -> eyre::Result<()> {
 
     let (tx, rx) = mpsc::channel::<TradeIntent>(256);
 
+    let watcher_pool = pool.clone();
     let watcher_fut = async move {
-        watcher::watch_leader(&ws_url, leader, tx).await;
+        watcher::watch_leader(&ws_url, leader, trader_id, watcher_pool, tx).await;
         #[allow(unreachable_code)]
         Ok::<_, eyre::Report>(())
     };
-    let exec_fut = run_executor(rx, cfg);
+    let exec_fut = run_executor(rx, cfg, pool);
 
     tokio::try_join!(watcher_fut, exec_fut)?;
     Ok(())

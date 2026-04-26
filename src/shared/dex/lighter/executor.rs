@@ -10,8 +10,11 @@ use super::markets::{Market, load_markets, symbol_root};
 use super::signer::{
     IS_ASK_BUY, IS_ASK_SELL, LighterSigner, ORDER_TYPE_MARKET, TIF_IOC,
 };
-use super::state::{CopyState, OpenPosition};
+use crate::db::{DbPool, trades};
+use crate::shared::dex::Dex;
 use crate::shared::intent::{Side, TradeIntent};
+
+const TARGET_DEX: Dex = Dex::Lighter;
 
 /// How long to wait after sendTx before snapshotting the post-fill position
 /// for delta computation. Lighter IOC market orders settle within hundreds of ms.
@@ -36,7 +39,11 @@ pub struct LighterConfig {
 
 const TX_TYPE_CREATE_ORDER: u8 = 14;
 
-pub async fn run(mut rx: mpsc::Receiver<TradeIntent>, cfg: LighterConfig) -> Result<()> {
+pub async fn run(
+    mut rx: mpsc::Receiver<TradeIntent>,
+    cfg: LighterConfig,
+    pool: DbPool,
+) -> Result<()> {
     let client = LighterClient::new(&cfg.base_url)?;
 
     let account_index = match cfg.account_index_override {
@@ -115,16 +122,18 @@ pub async fn run(mut rx: mpsc::Receiver<TradeIntent>, cfg: LighterConfig) -> Res
         )?)
     };
 
-    let mut state = CopyState::load();
+    let open_trades = trades::list_open_for_target(&pool, TARGET_DEX).await?;
     info!(
-        positions = state.len(),
+        positions = open_trades.len(),
         dry_run = cfg.dry_run,
         budget_usd = follower_budget_usd,
         leader_max_exposure_usd = cfg.leader_max_exposure_usd,
         "executor ready"
     );
 
-    if let Err(e) = reconcile_on_startup(&client, &markets, &mut state, account_index).await {
+    if let Err(e) =
+        reconcile_on_startup(&client, &markets, &pool, &open_trades, account_index).await
+    {
         warn!(error = ?e, "startup reconciliation failed; continuing with current state as-is");
     }
 
@@ -135,7 +144,7 @@ pub async fn run(mut rx: mpsc::Receiver<TradeIntent>, cfg: LighterConfig) -> Res
             &client,
             signer.as_ref(),
             &markets,
-            &mut state,
+            &pool,
             account_index,
             follower_budget_usd,
         )
@@ -155,22 +164,22 @@ async fn handle_intent(
     client: &LighterClient,
     signer: Option<&LighterSigner>,
     markets: &HashMap<String, Market>,
-    state: &mut CopyState,
+    pool: &DbPool,
     account_index: i64,
     follower_budget_usd: f64,
 ) -> Result<()> {
     match intent {
         TradeIntent::Open {
-            leader,
+            leader: _,
             symbol,
             side,
             leader_collateral_usd,
             leader_leverage,
             leader_exec_price,
-            leader_pair_index,
-            leader_position_index,
             source_tx,
             source_block,
+            signal_id,
+            symbol_id,
         } => {
             let root = symbol_root(symbol);
             let Some(market) = markets.get(&root) else {
@@ -292,31 +301,35 @@ async fn handle_intent(
                 sized.base_amount_int
             };
 
-            state.insert(OpenPosition {
-                leader: *leader,
-                leader_pair_index: *leader_pair_index,
-                leader_position_index: *leader_position_index,
-                symbol: symbol.clone(),
-                side: *side,
-                market_id: market.market_id,
-                base_amount: actual_filled,
-                opened_block: *source_block,
-                opened_tx: source_tx.clone(),
-            })?;
+            trades::record_open(
+                pool,
+                *signal_id,
+                TARGET_DEX,
+                market.market_id,
+                *symbol_id,
+                *side,
+                actual_filled,
+                Some(sized.target_collateral_usd),
+                Some(sized.target_leverage as i32),
+                Some(*leader_exec_price),
+                Some(source_tx),
+                Some(*source_block as i64),
+            )
+            .await?;
         }
 
         TradeIntent::Close {
-            leader,
+            leader: _,
             symbol,
             leader_pair_index,
             leader_position_index,
             leader_exec_price,
+            signal_id,
         } => {
-            let key = (*leader, *leader_pair_index, *leader_position_index);
-            let Some(open) = state.get(&key).cloned() else {
+            let Some(open) = trades::find_open_for_signal(pool, *signal_id).await? else {
                 warn!(
-                    %symbol, leader_pair_index, leader_position_index,
-                    "leader CLOSE for unknown position (likely opened before we started or different DEX) — skipping"
+                    %symbol, leader_pair_index, leader_position_index, signal_id,
+                    "leader CLOSE for unknown trade (likely opened before we started or different DEX) — skipping"
                 );
                 return Ok(());
             };
@@ -360,7 +373,7 @@ async fn handle_intent(
                 "sending Lighter market IOC CLOSE (reduce-only)"
             );
 
-            if let Some(signer) = signer {
+            let close_tx_hash: Option<String> = if let Some(signer) = signer {
                 let nonce = client
                     .next_nonce(account_index, cfg.api_key_index)
                     .await?;
@@ -388,11 +401,19 @@ async fn handle_intent(
                     ));
                 }
                 info!(target: "execute", tx_hash = %resp.tx_hash, "Lighter accepted CLOSE");
+                Some(resp.tx_hash)
             } else {
                 info!(target: "execute", dry_run = true, "[DRY] would send CLOSE");
-            }
+                None
+            };
 
-            state.remove(&key)?;
+            trades::record_close(
+                pool,
+                open.id,
+                Some(*leader_exec_price),
+                close_tx_hash.as_deref(),
+            )
+            .await?;
         }
     }
     Ok(())
@@ -418,20 +439,20 @@ fn signed_size_for_market(positions: &[AccountPosition], market_id: i32, size_de
 async fn reconcile_on_startup(
     client: &LighterClient,
     markets: &HashMap<String, Market>,
-    state: &mut CopyState,
+    pool: &DbPool,
+    open_trades: &[crate::db::models::Trade],
     account_index: i64,
 ) -> Result<()> {
     let det = client.account(account_index).await?;
 
-    // Aggregate state by market_id, signed.
+    // Aggregate open DB trades by market_id, signed.
     let mut state_by_market: HashMap<i32, i64> = HashMap::new();
-    for (_, pos) in state.iter() {
-        let signed: i64 = if matches!(pos.side, Side::Long) {
-            pos.base_amount
-        } else {
-            -pos.base_amount
+    for t in open_trades {
+        let signed: i64 = match t.side {
+            Side::Long => t.base_amount,
+            Side::Short => -t.base_amount,
         };
-        *state_by_market.entry(pos.market_id).or_default() += signed;
+        *state_by_market.entry(t.market_id).or_default() += signed;
     }
 
     // Resolve size_decimals per market_id from the markets map (fallback 0).
@@ -462,7 +483,7 @@ async fn reconcile_on_startup(
             warn!(
                 market_id = mid,
                 state_size,
-                "STALE: copy-state has entries but Lighter shows flat — dropping state for this market."
+                "STALE: copy-state has entries but Lighter shows flat — failing state for this market."
             );
             markets_to_drop.push(mid);
         } else if state_size != lighter_size {
@@ -476,8 +497,8 @@ async fn reconcile_on_startup(
     }
 
     for mid in markets_to_drop {
-        let dropped = state.drop_market(mid)?;
-        info!(market_id = mid, count = dropped.len(), "dropped stale state entries");
+        let dropped = trades::fail_open_for_market(pool, TARGET_DEX, mid).await?;
+        info!(market_id = mid, count = dropped, "failed stale state entries");
     }
     Ok(())
 }

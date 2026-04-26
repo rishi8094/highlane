@@ -18,15 +18,25 @@ use super::contracts::{
 };
 use super::format::{format_1e10, format_leverage, format_usdc};
 use super::pairs::load_pair_names;
+use crate::db::{DbPool, signals, symbols};
+use crate::shared::dex::Dex;
 use crate::shared::intent::{Side, TradeIntent};
+
+const SOURCE_DEX: Dex = Dex::Avantis;
 
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
-pub async fn watch_leader(ws_url: &str, leader: Address, tx: mpsc::Sender<TradeIntent>) -> ! {
+pub async fn watch_leader(
+    ws_url: &str,
+    leader: Address,
+    trader_id: i32,
+    pool: DbPool,
+    tx: mpsc::Sender<TradeIntent>,
+) -> ! {
     let mut backoff = BACKOFF_INITIAL;
     loop {
-        match run_session(ws_url, leader, &tx).await {
+        match run_session(ws_url, leader, trader_id, &pool, &tx).await {
             Ok(()) => {
                 warn!("subscription stream ended; reconnecting");
                 backoff = BACKOFF_INITIAL;
@@ -45,6 +55,8 @@ pub async fn watch_leader(ws_url: &str, leader: Address, tx: mpsc::Sender<TradeI
 async fn run_session(
     ws_url: &str,
     leader: Address,
+    trader_id: i32,
+    pool: &DbPool,
     tx: &mpsc::Sender<TradeIntent>,
 ) -> Result<()> {
     info!(%leader, "connecting to Base WSS");
@@ -75,7 +87,7 @@ async fn run_session(
 
     let mut stream = sub.into_stream();
     while let Some(log) = stream.next().await {
-        handle_log(&log, leader, &pairs, tx).await;
+        handle_log(&log, leader, trader_id, pool, &pairs, tx).await;
     }
     Ok(())
 }
@@ -83,6 +95,8 @@ async fn run_session(
 async fn handle_log(
     log: &alloy::rpc::types::Log,
     leader: Address,
+    trader_id: i32,
+    pool: &DbPool,
     pairs: &HashMap<u64, String>,
     tx: &mpsc::Sender<TradeIntent>,
 ) {
@@ -118,6 +132,10 @@ async fn handle_log(
                         collateral, leverage, exec_price, block, %tx_hash,
                         "leader OPEN (market)"
                     );
+                    let Some((symbol_id, signal_id)) = record_open(
+                        pool, trader_id, &symbol, side, pair_idx, pos_idx,
+                        collateral, leverage, exec_price, &tx_hash, block,
+                    ).await else { return };
                     TradeIntent::Open {
                         leader,
                         symbol,
@@ -125,10 +143,10 @@ async fn handle_log(
                         leader_collateral_usd: collateral,
                         leader_leverage: leverage,
                         leader_exec_price: exec_price,
-                        leader_pair_index: pair_idx,
-                        leader_position_index: pos_idx,
                         source_tx: tx_hash.clone(),
                         source_block: block,
+                        signal_id,
+                        symbol_id,
                     }
                 } else {
                     let pnl = format_pct_1e10(&ev.percentProfit);
@@ -138,12 +156,16 @@ async fn handle_log(
                         exec_price, pnl_pct = pnl, block, %tx_hash,
                         "leader CLOSE (market)"
                     );
+                    let Some(signal_id) = record_close(
+                        pool, trader_id, &symbol, pair_idx, pos_idx, exec_price, &tx_hash, block,
+                    ).await else { return };
                     TradeIntent::Close {
                         leader,
                         symbol,
                         leader_pair_index: pair_idx,
                         leader_position_index: pos_idx,
                         leader_exec_price: exec_price,
+                        signal_id,
                     }
                 };
                 if let Err(e) = tx.send(intent).await {
@@ -175,12 +197,16 @@ async fn handle_log(
                         %symbol, exec_price, pnl_pct = pnl, block, %tx_hash,
                         "leader CLOSE (keeper)"
                     );
+                    let Some(signal_id) = record_close(
+                        pool, trader_id, &symbol, pair_idx, pos_idx, exec_price, &tx_hash, block,
+                    ).await else { return };
                     TradeIntent::Close {
                         leader,
                         symbol,
                         leader_pair_index: pair_idx,
                         leader_position_index: pos_idx,
                         leader_exec_price: exec_price,
+                        signal_id,
                     }
                 } else {
                     info!(
@@ -189,6 +215,10 @@ async fn handle_log(
                         %symbol, %side, collateral, leverage, exec_price, block, %tx_hash,
                         "leader OPEN (keeper)"
                     );
+                    let Some((symbol_id, signal_id)) = record_open(
+                        pool, trader_id, &symbol, side, pair_idx, pos_idx,
+                        collateral, leverage, exec_price, &tx_hash, block,
+                    ).await else { return };
                     TradeIntent::Open {
                         leader,
                         symbol,
@@ -196,10 +226,10 @@ async fn handle_log(
                         leader_collateral_usd: collateral,
                         leader_leverage: leverage,
                         leader_exec_price: exec_price,
-                        leader_pair_index: pair_idx,
-                        leader_position_index: pos_idx,
                         source_tx: tx_hash.clone(),
                         source_block: block,
+                        signal_id,
+                        symbol_id,
                     }
                 };
                 if let Err(e) = tx.send(intent).await {
@@ -223,4 +253,87 @@ fn pair_name(pairs: &HashMap<u64, String>, idx: u64) -> String {
 fn format_pct_1e10(raw: &alloy::primitives::I256) -> f64 {
     let s = raw.to_string();
     s.parse::<f64>().unwrap_or(0.0) / 1e10
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_open(
+    pool: &DbPool,
+    trader_id: i32,
+    symbol: &str,
+    side: Side,
+    pair_idx: u64,
+    pos_idx: u64,
+    collateral: f64,
+    leverage: u64,
+    exec_price: f64,
+    tx_hash: &str,
+    block: u64,
+) -> Option<(i32, i32)> {
+    let symbol_id = match symbols::upsert(pool, symbol).await {
+        Ok(id) => id,
+        Err(e) => {
+            error!(error = ?e, %tx_hash, %symbol, "failed to upsert symbol; dropping intent");
+            return None;
+        }
+    };
+    let signal_id = match signals::record_open(
+        pool,
+        trader_id,
+        SOURCE_DEX,
+        symbol_id,
+        side,
+        pair_idx as i64,
+        pos_idx as i64,
+        collateral,
+        leverage as i32,
+        exec_price,
+        tx_hash,
+        block as i64,
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            error!(error = ?e, %tx_hash, "failed to record signal OPEN; dropping intent");
+            return None;
+        }
+    };
+    Some((symbol_id, signal_id))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_close(
+    pool: &DbPool,
+    trader_id: i32,
+    symbol: &str,
+    pair_idx: u64,
+    pos_idx: u64,
+    exec_price: f64,
+    tx_hash: &str,
+    block: u64,
+) -> Option<i32> {
+    match signals::record_close(
+        pool,
+        trader_id,
+        pair_idx as i64,
+        pos_idx as i64,
+        exec_price,
+        tx_hash,
+        block as i64,
+    )
+    .await
+    {
+        Ok(Some(id)) => Some(id),
+        Ok(None) => {
+            warn!(
+                %symbol, pair_idx, pos_idx, %tx_hash,
+                "leader CLOSE for unknown signal (likely opened before bot started); skipping"
+            );
+            None
+        }
+        Err(e) => {
+            error!(error = ?e, %tx_hash, "failed to record signal CLOSE; dropping intent");
+            None
+        }
+    }
 }
