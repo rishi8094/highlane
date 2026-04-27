@@ -13,7 +13,10 @@ use super::signer::{
 use crate::db::{DbPool, trades};
 use crate::shared::dex::Dex;
 use crate::shared::intent::{Side, TradeIntent};
-use crate::shared::notify::{CloseFill, DiscordNotifier, OpenFill, StartupInfo, UtilisationAlert};
+use crate::shared::notify::{
+    CloseFill, DiscordNotifier, OpenFill, StartupInfo, UnknownClose, UtilisationAlert,
+    UtilisationSeverity,
+};
 
 const TARGET_DEX: Dex = Dex::Lighter;
 
@@ -21,10 +24,15 @@ const TARGET_DEX: Dex = Dex::Lighter;
 /// for delta computation. Lighter IOC market orders settle within hundreds of ms.
 const POST_FILL_DELAY: Duration = Duration::from_millis(750);
 
-/// Capital utilisation alert thresholds. Fire one webhook when crossing
-/// `UTIL_FIRE`, then stay silent until utilisation falls below `UTIL_REARM`.
+/// Capital utilisation alert thresholds. Each level fires one webhook when
+/// crossed and re-arms only after utilisation drops below its rearm point —
+/// so we never spam at e.g. 75.1% bouncing across the threshold. The high
+/// level (90%) is independent so a critical alert still fires after a soft
+/// one disarms it.
 const UTIL_FIRE: f64 = 0.75;
 const UTIL_REARM: f64 = 0.70;
+const UTIL_FIRE_HIGH: f64 = 0.90;
+const UTIL_REARM_HIGH: f64 = 0.85;
 /// How often the background utilisation poller checks the Lighter account.
 const UTIL_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -191,13 +199,21 @@ fn spawn_utilisation_poller(
 ) {
     tokio::spawn(async move {
         let mut armed = true;
+        let mut armed_high = true;
         let mut tick = tokio::time::interval(UTIL_POLL_INTERVAL);
         // First tick fires immediately; skip it so we don't double up with the
         // startup webhook.
         tick.tick().await;
         loop {
             tick.tick().await;
-            if let Err(e) = check_utilisation(&client, account_index, &mut armed, &notifier).await
+            if let Err(e) = check_utilisation(
+                &client,
+                account_index,
+                &mut armed,
+                &mut armed_high,
+                &notifier,
+            )
+            .await
             {
                 warn!(target: "webhook", error = ?e, "utilisation poll failed");
             }
@@ -400,13 +416,26 @@ async fn handle_intent(
             leader_exec_price,
             leader_entry_price,
             leader_pnl_pct,
+            source_tx,
             signal_id,
         } => {
             let Some(open) = trades::find_open_for_signal(pool, *signal_id).await? else {
                 warn!(
-                    %symbol, leader_pair_index, leader_position_index, signal_id,
+                    %symbol, leader_pair_index, leader_position_index, signal_id, %source_tx,
                     "leader CLOSE for unknown trade (likely opened before we started or different DEX) — skipping"
                 );
+                if notifier.enabled() {
+                    notifier.notify_unknown_close(UnknownClose {
+                        symbol: symbol.clone(),
+                        leader_pair_index: *leader_pair_index,
+                        leader_position_index: *leader_position_index,
+                        leader_entry_price: *leader_entry_price,
+                        leader_close_price: *leader_exec_price,
+                        leader_pnl_pct: *leader_pnl_pct,
+                        signal_id: *signal_id,
+                        leader_tx: source_tx.clone(),
+                    });
+                }
                 return Ok(());
             };
             let Some(market) = markets.values().find(|m| m.market_id == open.market_id) else {
@@ -531,6 +560,7 @@ async fn check_utilisation(
     client: &LighterClient,
     account_index: i64,
     armed: &mut bool,
+    armed_high: &mut bool,
     notifier: &DiscordNotifier,
 ) -> Result<()> {
     let det = client.account(account_index).await?;
@@ -555,6 +585,29 @@ async fn check_utilisation(
     let used = (collateral - available).max(0.0);
     let pct = used / collateral;
 
+    if *armed_high && pct >= UTIL_FIRE_HIGH {
+        info!(
+            target: "webhook",
+            utilisation = pct, collateral, available, used,
+            "capital utilisation crossed CRITICAL threshold"
+        );
+        notifier.notify_utilisation(UtilisationAlert {
+            utilisation_pct: pct,
+            collateral_usd: collateral,
+            available_usd: available,
+            margin_used_usd: used,
+            severity: UtilisationSeverity::Critical,
+        });
+        *armed_high = false;
+    } else if !*armed_high && pct < UTIL_REARM_HIGH {
+        info!(
+            target: "webhook",
+            utilisation = pct,
+            "capital utilisation back below CRITICAL re-arm threshold"
+        );
+        *armed_high = true;
+    }
+
     if *armed && pct >= UTIL_FIRE {
         info!(
             target: "webhook",
@@ -566,6 +619,7 @@ async fn check_utilisation(
             collateral_usd: collateral,
             available_usd: available,
             margin_used_usd: used,
+            severity: UtilisationSeverity::Warn,
         });
         *armed = false;
     } else if !*armed && pct < UTIL_REARM {

@@ -57,6 +57,10 @@ pub enum TradeIntent {
         /// +1.84%). Optional because the keeper-fired LimitExecuted path only
         /// surfaces it when `isPnl=true`.
         leader_pnl_pct: Option<f64>,
+        /// Tx hash of the leader's close on the source DEX. Lets downstream
+        /// code reference the originating signal (e.g. in alerts when we
+        /// can't match the close to a known open trade).
+        source_tx: String,
         signal_id: i32,
     },
 }

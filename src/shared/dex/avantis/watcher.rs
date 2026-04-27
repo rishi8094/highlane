@@ -169,6 +169,7 @@ async fn handle_log(
                         // `pnl` from format_pct_1e10 is in percent (1.84 = 1.84%);
                         // intents carry PnL as a fraction so /100 here.
                         leader_pnl_pct: Some(pnl / 100.0),
+                        source_tx: tx_hash.clone(),
                         signal_id,
                     }
                 };
@@ -213,6 +214,7 @@ async fn handle_log(
                         leader_entry_price,
                         // pnl is in percent (see MarketExecuted branch); /100 → fraction.
                         leader_pnl_pct: Some(pnl / 100.0),
+                        source_tx: tx_hash.clone(),
                         signal_id,
                     }
                 } else {

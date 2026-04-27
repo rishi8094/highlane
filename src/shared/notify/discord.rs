@@ -52,12 +52,38 @@ pub struct CloseFill {
     pub our_tx: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UtilisationSeverity {
+    /// Soft warning, e.g. 75%.
+    Warn,
+    /// Hard warning, e.g. 90% — collateral is nearly exhausted.
+    Critical,
+}
+
 #[derive(Debug, Clone)]
 pub struct UtilisationAlert {
     pub utilisation_pct: f64,
     pub collateral_usd: f64,
     pub available_usd: f64,
     pub margin_used_usd: f64,
+    pub severity: UtilisationSeverity,
+}
+
+/// Fired when the executor sees a leader CLOSE for which we have no matching
+/// open trade row on the destination DEX. If the position was actually opened
+/// on the destination (e.g. by hand, or by a previous bot run), it's still
+/// live and needs manual intervention — this notification surfaces enough
+/// context to find and close it.
+#[derive(Debug, Clone)]
+pub struct UnknownClose {
+    pub symbol: String,
+    pub leader_pair_index: u64,
+    pub leader_position_index: u64,
+    pub leader_entry_price: f64,
+    pub leader_close_price: f64,
+    pub leader_pnl_pct: Option<f64>,
+    pub signal_id: i32,
+    pub leader_tx: String,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +135,10 @@ impl DiscordNotifier {
 
     pub fn notify_utilisation(&self, alert: UtilisationAlert) {
         self.spawn_send(build_utilisation_embed(&alert));
+    }
+
+    pub fn notify_unknown_close(&self, info: UnknownClose) {
+        self.spawn_send(build_unknown_close_embed(&info));
     }
 
     pub fn notify_startup(&self, info: StartupInfo) {
@@ -299,11 +329,44 @@ fn build_startup_embed(info: &StartupInfo) -> Value {
     json!({ "embeds": [embed] })
 }
 
-fn build_utilisation_embed(a: &UtilisationAlert) -> Value {
-    let title = format!("⚠ Capital utilisation {}", fmt_pct(a.utilisation_pct));
+fn build_unknown_close_embed(info: &UnknownClose) -> Value {
+    let title = format!("⚠ Unmatched leader CLOSE · {}", info.symbol);
+    let leader_pnl = match info.leader_pnl_pct {
+        Some(pct) => fmt_signed_pct(pct),
+        None => "—".to_string(),
+    };
+    let tx_field = if !info.leader_tx.is_empty() && info.leader_tx != "?" {
+        format!("`{}`", info.leader_tx)
+    } else {
+        "—".to_string()
+    };
     let embed = json!({
         "title": title,
         "color": COLOR_AMBER,
+        "description": "Leader closed a position we have no open trade row for. If this position is live on the destination DEX, close it manually.",
+        "fields": [
+            { "name": "Symbol", "value": info.symbol.clone(), "inline": true },
+            { "name": "Signal id", "value": info.signal_id.to_string(), "inline": true },
+            { "name": "Leader pair / pos", "value": format!("{} / {}", info.leader_pair_index, info.leader_position_index), "inline": true },
+            { "name": "Leader entry", "value": fmt_usd(info.leader_entry_price), "inline": true },
+            { "name": "Leader close", "value": fmt_usd(info.leader_close_price), "inline": true },
+            { "name": "Leader PnL", "value": leader_pnl, "inline": true },
+            { "name": "Leader tx", "value": tx_field, "inline": false },
+        ],
+        "timestamp": Utc::now().to_rfc3339(),
+    });
+    json!({ "embeds": [embed] })
+}
+
+fn build_utilisation_embed(a: &UtilisationAlert) -> Value {
+    let (prefix, color) = match a.severity {
+        UtilisationSeverity::Warn => ("⚠", COLOR_AMBER),
+        UtilisationSeverity::Critical => ("🚨", COLOR_LOSS),
+    };
+    let title = format!("{prefix} Capital utilisation {}", fmt_pct(a.utilisation_pct));
+    let embed = json!({
+        "title": title,
+        "color": color,
         "fields": [
             { "name": "Margin used", "value": fmt_usd(a.margin_used_usd), "inline": true },
             { "name": "Available", "value": fmt_usd(a.available_usd), "inline": true },
@@ -478,6 +541,7 @@ mod tests {
             collateral_usd: 1_000.0,
             available_usd: 217.9,
             margin_used_usd: 782.1,
+            severity: UtilisationSeverity::Warn,
         });
         let s = serde_json::to_string(&v).unwrap();
         assert!(s.contains("78.2%"), "{s}");
