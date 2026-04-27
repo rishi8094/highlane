@@ -50,6 +50,13 @@ pub enum TradeIntent {
         /// → human float). Used to bound our reduce-only IOC on Lighter so the
         /// signer doesn't reject `price=0`.
         leader_exec_price: f64,
+        /// Leader's original entry price (from the matching signals row), kept
+        /// alongside the close so notifications can show their entry/exit pair.
+        leader_entry_price: f64,
+        /// Leader's realised PnL on this close as a fraction (e.g. 0.0184 =
+        /// +1.84%). Optional because the keeper-fired LimitExecuted path only
+        /// surfaces it when `isPnl=true`.
+        leader_pnl_pct: Option<f64>,
         signal_id: i32,
     },
 }

@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eyre::Result;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::client::{AccountPosition, LighterClient};
 use super::markets::{Market, load_markets, symbol_root};
@@ -13,12 +13,20 @@ use super::signer::{
 use crate::db::{DbPool, trades};
 use crate::shared::dex::Dex;
 use crate::shared::intent::{Side, TradeIntent};
+use crate::shared::notify::{CloseFill, DiscordNotifier, OpenFill, StartupInfo, UtilisationAlert};
 
 const TARGET_DEX: Dex = Dex::Lighter;
 
 /// How long to wait after sendTx before snapshotting the post-fill position
 /// for delta computation. Lighter IOC market orders settle within hundreds of ms.
 const POST_FILL_DELAY: Duration = Duration::from_millis(750);
+
+/// Capital utilisation alert thresholds. Fire one webhook when crossing
+/// `UTIL_FIRE`, then stay silent until utilisation falls below `UTIL_REARM`.
+const UTIL_FIRE: f64 = 0.75;
+const UTIL_REARM: f64 = 0.70;
+/// How often the background utilisation poller checks the Lighter account.
+const UTIL_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub struct LighterConfig {
@@ -43,6 +51,8 @@ pub async fn run(
     mut rx: mpsc::Receiver<TradeIntent>,
     cfg: LighterConfig,
     pool: DbPool,
+    notifier: DiscordNotifier,
+    leader_address: String,
 ) -> Result<()> {
     let client = LighterClient::new(&cfg.base_url)?;
 
@@ -137,6 +147,22 @@ pub async fn run(
         warn!(error = ?e, "startup reconciliation failed; continuing with current state as-is");
     }
 
+    if notifier.enabled() {
+        notifier.notify_startup(StartupInfo {
+            leader_address: leader_address.clone(),
+            follower_l1_address: cfg.l1_address.clone(),
+            account_index,
+            budget_usd: follower_budget_usd,
+            leader_max_exposure_usd: cfg.leader_max_exposure_usd,
+            slippage_bps: cfg.slippage_bps,
+            dry_run: cfg.dry_run,
+        });
+    }
+
+    if !cfg.dry_run && notifier.enabled() {
+        spawn_utilisation_poller(client.clone(), account_index, notifier.clone());
+    }
+
     while let Some(intent) = rx.recv().await {
         if let Err(e) = handle_intent(
             &intent,
@@ -147,6 +173,7 @@ pub async fn run(
             &pool,
             account_index,
             follower_budget_usd,
+            &notifier,
         )
         .await
         {
@@ -155,6 +182,27 @@ pub async fn run(
     }
     warn!("intent channel closed; executor stopping");
     Ok(())
+}
+
+fn spawn_utilisation_poller(
+    client: LighterClient,
+    account_index: i64,
+    notifier: DiscordNotifier,
+) {
+    tokio::spawn(async move {
+        let mut armed = true;
+        let mut tick = tokio::time::interval(UTIL_POLL_INTERVAL);
+        // First tick fires immediately; skip it so we don't double up with the
+        // startup webhook.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            if let Err(e) = check_utilisation(&client, account_index, &mut armed, &notifier).await
+            {
+                warn!(target: "webhook", error = ?e, "utilisation poll failed");
+            }
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -167,6 +215,7 @@ async fn handle_intent(
     pool: &DbPool,
     account_index: i64,
     follower_budget_usd: f64,
+    notifier: &DiscordNotifier,
 ) -> Result<()> {
     match intent {
         TradeIntent::Open {
@@ -231,6 +280,8 @@ async fn handle_intent(
                 "sending Lighter market IOC OPEN"
             );
 
+            let mut our_tx_hash: Option<String> = None;
+
             let actual_filled = if let Some(signer) = signer {
                 let pre_size = current_signed_size(client, account_index, market).await?;
 
@@ -265,6 +316,7 @@ async fn handle_intent(
                     tx_hash = %resp.tx_hash, code = resp.code,
                     "Lighter accepted OPEN"
                 );
+                our_tx_hash = Some(resp.tx_hash);
 
                 tokio::time::sleep(POST_FILL_DELAY).await;
                 let post_size = current_signed_size(client, account_index, market).await?;
@@ -316,6 +368,28 @@ async fn handle_intent(
                 Some(*source_block as i64),
             )
             .await?;
+
+            if !cfg.dry_run && notifier.enabled() {
+                let size_human = actual_filled as f64 / 10f64.powi(market.size_decimals);
+                // Lighter doesn't return a per-fill VWAP; the IOC's slippage
+                // bound is the worst price we could have accepted, so use it
+                // as our notional reference. This will read as 0 bps slippage
+                // in the embed when the order filled inside the bound.
+                let our_price = price_int as f64 / 10f64.powi(market.price_decimals);
+                let notional_usd = size_human * our_price;
+                notifier.notify_open(OpenFill {
+                    symbol: symbol.clone(),
+                    side: *side,
+                    leader_price: *leader_exec_price,
+                    our_price,
+                    size: size_human,
+                    notional_usd,
+                    collateral_usd: sized.target_collateral_usd,
+                    leverage: sized.target_leverage as u32,
+                    leader_tx: source_tx.clone(),
+                    our_tx: our_tx_hash,
+                });
+            }
         }
 
         TradeIntent::Close {
@@ -324,6 +398,8 @@ async fn handle_intent(
             leader_pair_index,
             leader_position_index,
             leader_exec_price,
+            leader_entry_price,
+            leader_pnl_pct,
             signal_id,
         } => {
             let Some(open) = trades::find_open_for_signal(pool, *signal_id).await? else {
@@ -414,7 +490,91 @@ async fn handle_intent(
                 close_tx_hash.as_deref(),
             )
             .await?;
+
+            if !cfg.dry_run && notifier.enabled() {
+                let size_human = open.size as f64 / 10f64.powi(market.size_decimals);
+                // Close fill price isn't returned by Lighter either; the IOC
+                // bound is again our worst-case reference.
+                let our_close_price = price_int as f64 / 10f64.powi(market.price_decimals);
+                let entry_price = open.entry_price.unwrap_or(0.0);
+                let entry_collateral = open.entry_collateral_usd.unwrap_or(0.0);
+                let direction: f64 = match open.side {
+                    Side::Long => 1.0,
+                    Side::Short => -1.0,
+                };
+                let pnl_usd = (our_close_price - entry_price) * size_human * direction;
+                let pnl_pct = if entry_collateral > 0.0 {
+                    pnl_usd / entry_collateral
+                } else {
+                    0.0
+                };
+                notifier.notify_close(CloseFill {
+                    symbol: symbol.clone(),
+                    side: open.side,
+                    leader_close_price: *leader_exec_price,
+                    our_close_price,
+                    size: size_human,
+                    our_entry_price: entry_price,
+                    leader_entry_price: *leader_entry_price,
+                    our_pnl_usd: pnl_usd,
+                    our_pnl_pct: pnl_pct,
+                    leader_pnl_pct: *leader_pnl_pct,
+                    our_tx: close_tx_hash,
+                });
+            }
         }
+    }
+    Ok(())
+}
+
+async fn check_utilisation(
+    client: &LighterClient,
+    account_index: i64,
+    armed: &mut bool,
+    notifier: &DiscordNotifier,
+) -> Result<()> {
+    let det = client.account(account_index).await?;
+    // Both fields must parse — if either is missing we can't compute a
+    // meaningful ratio (e.g. defaulting available to 0 would falsely report
+    // 100% utilisation and trigger the alert).
+    let Some(collateral) = det.collateral.as_deref().and_then(|s| s.parse::<f64>().ok()) else {
+        debug!(target: "webhook", "skipping utilisation check: missing collateral");
+        return Ok(());
+    };
+    let Some(available) = det
+        .available_balance
+        .as_deref()
+        .and_then(|s| s.parse::<f64>().ok())
+    else {
+        debug!(target: "webhook", "skipping utilisation check: missing available_balance");
+        return Ok(());
+    };
+    if collateral <= 0.0 {
+        return Ok(());
+    }
+    let used = (collateral - available).max(0.0);
+    let pct = used / collateral;
+
+    if *armed && pct >= UTIL_FIRE {
+        info!(
+            target: "webhook",
+            utilisation = pct, collateral, available, used,
+            "capital utilisation crossed alert threshold"
+        );
+        notifier.notify_utilisation(UtilisationAlert {
+            utilisation_pct: pct,
+            collateral_usd: collateral,
+            available_usd: available,
+            margin_used_usd: used,
+        });
+        *armed = false;
+    } else if !*armed && pct < UTIL_REARM {
+        info!(
+            target: "webhook",
+            utilisation = pct,
+            "capital utilisation back below re-arm threshold"
+        );
+        *armed = true;
     }
     Ok(())
 }

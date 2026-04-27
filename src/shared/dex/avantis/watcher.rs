@@ -156,7 +156,7 @@ async fn handle_log(
                         exec_price, pnl_pct = pnl, block, %tx_hash,
                         "leader CLOSE (market)"
                     );
-                    let Some(signal_id) = record_close(
+                    let Some((signal_id, leader_entry_price)) = record_close(
                         pool, trader_id, &symbol, pair_idx, pos_idx, exec_price, &tx_hash, block,
                     ).await else { return };
                     TradeIntent::Close {
@@ -165,6 +165,10 @@ async fn handle_log(
                         leader_pair_index: pair_idx,
                         leader_position_index: pos_idx,
                         leader_exec_price: exec_price,
+                        leader_entry_price,
+                        // `pnl` from format_pct_1e10 is in percent (1.84 = 1.84%);
+                        // intents carry PnL as a fraction so /100 here.
+                        leader_pnl_pct: Some(pnl / 100.0),
                         signal_id,
                     }
                 };
@@ -197,7 +201,7 @@ async fn handle_log(
                         %symbol, exec_price, pnl_pct = pnl, block, %tx_hash,
                         "leader CLOSE (keeper)"
                     );
-                    let Some(signal_id) = record_close(
+                    let Some((signal_id, leader_entry_price)) = record_close(
                         pool, trader_id, &symbol, pair_idx, pos_idx, exec_price, &tx_hash, block,
                     ).await else { return };
                     TradeIntent::Close {
@@ -206,6 +210,9 @@ async fn handle_log(
                         leader_pair_index: pair_idx,
                         leader_position_index: pos_idx,
                         leader_exec_price: exec_price,
+                        leader_entry_price,
+                        // pnl is in percent (see MarketExecuted branch); /100 → fraction.
+                        leader_pnl_pct: Some(pnl / 100.0),
                         signal_id,
                     }
                 } else {
@@ -311,7 +318,7 @@ async fn record_close(
     exec_price: f64,
     tx_hash: &str,
     block: u64,
-) -> Option<i32> {
+) -> Option<(i32, f64)> {
     match signals::record_close(
         pool,
         trader_id,
@@ -323,7 +330,7 @@ async fn record_close(
     )
     .await
     {
-        Ok(Some(id)) => Some(id),
+        Ok(Some(row)) => Some(row),
         Ok(None) => {
             warn!(
                 %symbol, pair_idx, pos_idx, %tx_hash,

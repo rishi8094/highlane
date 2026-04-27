@@ -55,9 +55,11 @@ pub async fn record_open(
     Ok(id)
 }
 
-/// Mark the signal closed by stamping the exit_* columns. Returns the signal
-/// id. If the row doesn't exist (leader closed a position we never saw open),
-/// returns `None`. Will only update an open row (`exit_at IS NULL`).
+/// Mark the signal closed by stamping the exit_* columns. Returns
+/// `(signal_id, entry_price)` for the row we updated, so callers can build
+/// downstream events (e.g. notifications) without a second round-trip. If the
+/// row doesn't exist (leader closed a position we never saw open), returns
+/// `None`. Will only update an open row (`exit_at IS NULL`).
 pub async fn record_close(
     pool: &DbPool,
     trader_id: i32,
@@ -66,10 +68,10 @@ pub async fn record_close(
     exit_price: f64,
     exit_tx: &str,
     exit_block: i64,
-) -> Result<Option<i32>> {
+) -> Result<Option<(i32, f64)>> {
     let mut conn = pool.get().await?;
     let now = Utc::now();
-    let id: Option<i32> = diesel::update(
+    let row: Option<(i32, f64)> = diesel::update(
         signals::table
             .filter(signals::trader_id.eq(trader_id))
             .filter(signals::leader_pair_index.eq(leader_pair_index))
@@ -82,9 +84,9 @@ pub async fn record_close(
         signals::exit_block.eq(Some(exit_block)),
         signals::exit_at.eq(Some(now)),
     ))
-    .returning(signals::id)
+    .returning((signals::id, signals::entry_price))
     .get_result(&mut conn)
     .await
     .optional()?;
-    Ok(id)
+    Ok(row)
 }
