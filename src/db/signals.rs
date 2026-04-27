@@ -9,8 +9,12 @@ use crate::schema::signals;
 use crate::shared::dex::Dex;
 use crate::shared::intent::Side;
 
-/// Idempotent insert keyed by `(trader_id, leader_pair_index, leader_position_index)`.
-/// Returns the row's id (existing or new).
+/// Insert one row per leader open. Idempotent on `(trader_id, entry_tx,
+/// leader_position_index)` so a re-delivered on-chain log produces no
+/// duplicate. Each leader open at a given `leader_position_index` produces a
+/// new row — Avantis recycles position slots when a position closes, so we
+/// can't key by slot alone or `record_close` would never find the right open
+/// row after a slot is reused. Returns the row's id (existing or new).
 #[allow(clippy::too_many_arguments)]
 pub async fn record_open(
     pool: &DbPool,
@@ -44,7 +48,7 @@ pub async fn record_open(
         .values(&new)
         .on_conflict((
             signals::trader_id,
-            signals::leader_pair_index,
+            signals::entry_tx,
             signals::leader_position_index,
         ))
         .do_update()
