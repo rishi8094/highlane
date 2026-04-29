@@ -9,11 +9,7 @@ use crate::shared::dex::Dex;
 
 /// Insert the trader if missing, otherwise return the existing row's id.
 /// Idempotent on `(wallet_address, source_dex)`.
-pub async fn upsert_trader(
-    pool: &DbPool,
-    wallet_address: &str,
-    source_dex: Dex,
-) -> Result<i32> {
+pub async fn upsert_trader(pool: &DbPool, wallet_address: &str, source_dex: Dex) -> Result<i32> {
     let mut conn = pool.get().await?;
     let new = NewTrader {
         wallet_address,

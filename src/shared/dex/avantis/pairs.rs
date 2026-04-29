@@ -46,7 +46,9 @@ fn find_cache_file() -> Option<(std::path::PathBuf, u64)> {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if let Some(ts_str) = name.strip_prefix("pairs-").and_then(|s| s.strip_suffix(".json"))
+        if let Some(ts_str) = name
+            .strip_prefix("pairs-")
+            .and_then(|s| s.strip_suffix(".json"))
             && let Ok(ts) = ts_str.parse::<u64>()
         {
             return Some((entry.path(), ts));
@@ -132,8 +134,7 @@ async fn fetch_pair_names(
     let mut pair_names = HashMap::new();
     for (i, result) in results.iter().enumerate() {
         if result.success {
-            if let Ok(data) =
-                IPairStorage::getPairDataCall::abi_decode_returns(&result.returnData)
+            if let Ok(data) = IPairStorage::getPairDataCall::abi_decode_returns(&result.returnData)
             {
                 let name = format!("{}/{}", data.from, data.to);
                 pair_names.insert(i as u64, name);

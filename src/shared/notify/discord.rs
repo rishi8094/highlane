@@ -363,7 +363,10 @@ fn build_utilisation_embed(a: &UtilisationAlert) -> Value {
         UtilisationSeverity::Warn => ("⚠", COLOR_AMBER),
         UtilisationSeverity::Critical => ("🚨", COLOR_LOSS),
     };
-    let title = format!("{prefix} Capital utilisation {}", fmt_pct(a.utilisation_pct));
+    let title = format!(
+        "{prefix} Capital utilisation {}",
+        fmt_pct(a.utilisation_pct)
+    );
     let embed = json!({
         "title": title,
         "color": color,

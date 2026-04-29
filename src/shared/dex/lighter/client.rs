@@ -12,9 +12,7 @@ pub struct LighterClient {
 
 impl LighterClient {
     pub fn new(base_url: impl Into<String>) -> Result<Self> {
-        let http = Http::builder()
-            .timeout(Duration::from_secs(15))
-            .build()?;
+        let http = Http::builder().timeout(Duration::from_secs(15)).build()?;
         Ok(Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             http,
@@ -57,8 +55,8 @@ impl LighterClient {
         if !status.is_success() {
             return Err(eyre!("nextNonce {status}: {body}"));
         }
-        let v: NextNonceResp = serde_json::from_str(&body)
-            .with_context(|| format!("decode nextNonce: {body}"))?;
+        let v: NextNonceResp =
+            serde_json::from_str(&body).with_context(|| format!("decode nextNonce: {body}"))?;
         Ok(v.nonce)
     }
 

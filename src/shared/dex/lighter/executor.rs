@@ -7,9 +7,7 @@ use tracing::{debug, error, info, warn};
 
 use super::client::{AccountPosition, LighterClient};
 use super::markets::{Market, load_markets, symbol_root};
-use super::signer::{
-    IS_ASK_BUY, IS_ASK_SELL, LighterSigner, ORDER_TYPE_MARKET, TIF_IOC,
-};
+use super::signer::{IS_ASK_BUY, IS_ASK_SELL, LighterSigner, ORDER_TYPE_MARKET, TIF_IOC};
 use crate::db::{DbPool, trades};
 use crate::shared::dex::Dex;
 use crate::shared::intent::{Side, TradeIntent};
@@ -70,9 +68,7 @@ pub async fn run(
             idx
         }
         None => {
-            let resp = client
-                .accounts_by_l1_address(&cfg.l1_address)
-                .await?;
+            let resp = client.accounts_by_l1_address(&cfg.l1_address).await?;
             // Prefer account_type=0 (main cross account) over system slots.
             let chosen = resp
                 .sub_accounts
@@ -115,7 +111,8 @@ pub async fn run(
                 ));
             }
             info!(
-                account_index, budget = bal,
+                account_index,
+                budget = bal,
                 "using live Lighter wallet balance as budget"
             );
             bal
@@ -192,11 +189,7 @@ pub async fn run(
     Ok(())
 }
 
-fn spawn_utilisation_poller(
-    client: LighterClient,
-    account_index: i64,
-    notifier: DiscordNotifier,
-) {
+fn spawn_utilisation_poller(client: LighterClient, account_index: i64, notifier: DiscordNotifier) {
     tokio::spawn(async move {
         let mut armed = true;
         let mut armed_high = true;
@@ -301,9 +294,7 @@ async fn handle_intent(
             let actual_filled = if let Some(signer) = signer {
                 let pre_size = current_signed_size(client, account_index, market).await?;
 
-                let nonce = client
-                    .next_nonce(account_index, cfg.api_key_index)
-                    .await?;
+                let nonce = client.next_nonce(account_index, cfg.api_key_index).await?;
                 let signed = signer.sign_create_order(
                     market.market_id,
                     client_order_id(),
@@ -317,9 +308,7 @@ async fn handle_intent(
                     0,
                     nonce,
                 )?;
-                let resp = client
-                    .send_tx(TX_TYPE_CREATE_ORDER, &signed)
-                    .await?;
+                let resp = client.send_tx(TX_TYPE_CREATE_ORDER, &signed).await?;
                 if resp.code != 0 && resp.code != 200 {
                     return Err(eyre::eyre!(
                         "Lighter sendTx OPEN rejected: code={} msg={}",
@@ -479,9 +468,7 @@ async fn handle_intent(
             );
 
             let close_tx_hash: Option<String> = if let Some(signer) = signer {
-                let nonce = client
-                    .next_nonce(account_index, cfg.api_key_index)
-                    .await?;
+                let nonce = client.next_nonce(account_index, cfg.api_key_index).await?;
                 let signed = signer.sign_create_order(
                     open.market_id,
                     client_order_id(),
@@ -495,9 +482,7 @@ async fn handle_intent(
                     0,
                     nonce,
                 )?;
-                let resp = client
-                    .send_tx(TX_TYPE_CREATE_ORDER, &signed)
-                    .await?;
+                let resp = client.send_tx(TX_TYPE_CREATE_ORDER, &signed).await?;
                 if resp.code != 0 && resp.code != 200 {
                     return Err(eyre::eyre!(
                         "Lighter sendTx CLOSE rejected: code={} msg={}",
@@ -567,7 +552,11 @@ async fn check_utilisation(
     // Both fields must parse — if either is missing we can't compute a
     // meaningful ratio (e.g. defaulting available to 0 would falsely report
     // 100% utilisation and trigger the alert).
-    let Some(collateral) = det.collateral.as_deref().and_then(|s| s.parse::<f64>().ok()) else {
+    let Some(collateral) = det
+        .collateral
+        .as_deref()
+        .and_then(|s| s.parse::<f64>().ok())
+    else {
         debug!(target: "webhook", "skipping utilisation check: missing collateral");
         return Ok(());
     };
@@ -639,10 +628,18 @@ async fn current_signed_size(
     market: &Market,
 ) -> Result<i64> {
     let det = client.account(account_index).await?;
-    Ok(signed_size_for_market(&det.positions, market.market_id, market.size_decimals))
+    Ok(signed_size_for_market(
+        &det.positions,
+        market.market_id,
+        market.size_decimals,
+    ))
 }
 
-fn signed_size_for_market(positions: &[AccountPosition], market_id: i32, size_decimals: i32) -> i64 {
+fn signed_size_for_market(
+    positions: &[AccountPosition],
+    market_id: i32,
+    size_decimals: i32,
+) -> i64 {
     positions
         .iter()
         .find(|p| p.market_id == market_id)
@@ -702,7 +699,9 @@ async fn reconcile_on_startup(
             markets_to_drop.push(mid);
         } else if state_size != lighter_size {
             warn!(
-                market_id = mid, state_size, lighter_size,
+                market_id = mid,
+                state_size,
+                lighter_size,
                 "DRIFT: copy-state and Lighter sizes differ but neither is 0 — leaving state alone."
             );
         } else {
@@ -712,7 +711,11 @@ async fn reconcile_on_startup(
 
     for mid in markets_to_drop {
         let dropped = trades::fail_open_for_market(pool, TARGET_DEX, mid).await?;
-        info!(market_id = mid, count = dropped, "failed stale state entries");
+        info!(
+            market_id = mid,
+            count = dropped,
+            "failed stale state entries"
+        );
     }
     Ok(())
 }
@@ -867,7 +870,10 @@ mod tests {
         // Want target ≈ $50 (≥ 50% of $77). Leader: $6,250 at 1x → $50 follower notional.
         let s = match size_for_open(6_250.0, 1, 77_000.0, 1_000.0, 125_000.0, &market) {
             Sizing::Ok(s) => s,
-            Sizing::SkipBelowMin { target_notional, min_notional } => {
+            Sizing::SkipBelowMin {
+                target_notional,
+                min_notional,
+            } => {
                 panic!("should round up; target={target_notional} min={min_notional}")
             }
         };

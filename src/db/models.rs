@@ -1,6 +1,6 @@
 use diesel::prelude::*;
 
-use crate::schema::{signals, trades, traders};
+use crate::schema::{signals, traders, trades};
 use crate::shared::dex::Dex;
 use crate::shared::intent::Side;
 

@@ -1,12 +1,9 @@
-mod db;
-mod schema;
-mod shared;
-
-use shared::dex::Dex;
-use shared::dex::avantis::{contracts::parse_addr, watcher};
-use shared::dex::lighter::executor::{LighterConfig, run as run_executor};
-use shared::intent::TradeIntent;
-use shared::notify::DiscordNotifier;
+use highlane::db;
+use highlane::shared::dex::Dex;
+use highlane::shared::dex::avantis::{contracts::parse_addr, watcher};
+use highlane::shared::dex::lighter::executor::{LighterConfig, run as run_executor};
+use highlane::shared::intent::TradeIntent;
+use highlane::shared::notify::DiscordNotifier;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 

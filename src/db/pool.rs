@@ -3,8 +3,8 @@ use std::sync::Arc;
 use diesel::Connection;
 use diesel::pg::PgConnection;
 use diesel_async::AsyncPgConnection;
-use diesel_async::pooled_connection::{AsyncDieselConnectionManager, ManagerConfig};
 use diesel_async::pooled_connection::bb8::Pool;
+use diesel_async::pooled_connection::{AsyncDieselConnectionManager, ManagerConfig};
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use eyre::{Context, Result};
 use rustls::{ClientConfig, RootCertStore};
@@ -28,8 +28,7 @@ pub async fn init() -> Result<DbPool> {
 
     let mut mgr_cfg: ManagerConfig<AsyncPgConnection> = ManagerConfig::default();
     mgr_cfg.custom_setup = Box::new(|url| Box::pin(establish_tls(url.to_string())));
-    let manager =
-        AsyncDieselConnectionManager::<AsyncPgConnection>::new_with_config(url, mgr_cfg);
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new_with_config(url, mgr_cfg);
     let pool = Pool::builder()
         .max_size(8)
         .build(manager)
@@ -69,8 +68,8 @@ fn tls_config() -> Arc<ClientConfig> {
 /// Migrations run on a short-lived sync connection. `diesel_migrations` is
 /// sync-only; libpq handles SSL transparently so no extra config is needed.
 fn run_migrations(url: &str) -> Result<()> {
-    let mut conn = PgConnection::establish(url)
-        .with_context(|| "connecting to Postgres for migrations")?;
+    let mut conn =
+        PgConnection::establish(url).with_context(|| "connecting to Postgres for migrations")?;
     let applied = conn
         .run_pending_migrations(MIGRATIONS)
         .map_err(|e| eyre::eyre!("migration failure: {e}"))?;

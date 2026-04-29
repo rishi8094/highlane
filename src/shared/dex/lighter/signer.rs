@@ -108,8 +108,8 @@ impl LighterSigner {
             .with_context(|| format!("dlopen {}", library_path.display()))?;
         let lib = Arc::new(lib);
 
-        let create_client: Symbol<CreateClientFn> = unsafe { lib.get(b"CreateClient\0") }
-            .context("locate CreateClient symbol")?;
+        let create_client: Symbol<CreateClientFn> =
+            unsafe { lib.get(b"CreateClient\0") }.context("locate CreateClient symbol")?;
         let sign_create_order: Symbol<SignCreateOrderFn> =
             unsafe { lib.get(b"SignCreateOrder\0") }.context("locate SignCreateOrder symbol")?;
         let free: Symbol<FreeFn> = unsafe { lib.get(b"Free\0") }.context("locate Free symbol")?;
@@ -134,8 +134,8 @@ impl LighterSigner {
         }
 
         info!(
-            chain_id, api_key_index, account_index,
-            "Lighter signer loaded"
+            chain_id,
+            api_key_index, account_index, "Lighter signer loaded"
         );
 
         let sign_create_order = *sign_create_order;

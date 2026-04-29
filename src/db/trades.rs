@@ -104,11 +104,7 @@ pub async fn list_open_for_target(pool: &DbPool, target_dex: Dex) -> Result<Vec<
 /// finds copy-state for a market that the exchange shows as flat. Readers
 /// distinguish "leader-closed" (exit_price set) from "reconcile-failed"
 /// (exit_at set, exit_price null).
-pub async fn fail_open_for_market(
-    pool: &DbPool,
-    target_dex: Dex,
-    market_id: i32,
-) -> Result<usize> {
+pub async fn fail_open_for_market(pool: &DbPool, target_dex: Dex, market_id: i32) -> Result<usize> {
     let mut conn = pool.get().await?;
     let now = Utc::now();
     let n = diesel::update(

@@ -27,6 +27,14 @@ const SOURCE_DEX: Dex = Dex::Avantis;
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// Avantis `LimitExecuted.orderType` enum:
+///   0 = TP, 1 = SL, 2 = LIQ (all closes), 3 = LIMIT_OPEN (open).
+/// Anything other than 3 is a keeper-driven close. We route on this rather
+/// than `ev.isPnl` because `isPnl` is observed `false` even on SL/TP/LIQ
+/// closes in production — using it caused us to record TP/SL closes as
+/// fresh OPENs at the trigger price (see signal 653 LIT/USD on 2026-04-29).
+const ORDER_TYPE_LIMIT_OPEN: u8 = 3;
+
 pub async fn watch_leader(
     ws_url: &str,
     leader: Address,
@@ -133,9 +141,13 @@ async fn handle_log(
                         "leader OPEN (market)"
                     );
                     let Some((symbol_id, signal_id)) = record_open(
-                        pool, trader_id, &symbol, side, pair_idx, pos_idx,
-                        collateral, leverage, exec_price, &tx_hash, block,
-                    ).await else { return };
+                        pool, trader_id, &symbol, side, pair_idx, pos_idx, collateral, leverage,
+                        exec_price, &tx_hash, block,
+                    )
+                    .await
+                    else {
+                        return;
+                    };
                     TradeIntent::Open {
                         leader,
                         symbol,
@@ -158,7 +170,11 @@ async fn handle_log(
                     );
                     let Some((signal_id, leader_entry_price)) = record_close(
                         pool, trader_id, &symbol, pair_idx, pos_idx, exec_price, &tx_hash, block,
-                    ).await else { return };
+                    )
+                    .await
+                    else {
+                        return;
+                    };
                     TradeIntent::Close {
                         leader,
                         symbol,
@@ -193,18 +209,45 @@ async fn handle_log(
                 let collateral = format_usdc(ev.positionSizeUSDC);
                 let exec_price = format_1e10(ev.price);
                 let side = if ev.t.buy { Side::Long } else { Side::Short };
+                let pnl_pct = format_pct_1e10(&ev.percentProfit);
 
-                let intent = if ev.isPnl {
-                    let pnl = format_pct_1e10(&ev.percentProfit);
+                // Route on orderType, NOT ev.isPnl — see ORDER_TYPE_LIMIT_OPEN
+                // doc above. Cross-check against price/pct heuristics: a real
+                // close has openPrice ≠ exec_price OR percentProfit ≠ 0; an
+                // open has both equal/zero. If routing disagrees with that
+                // invariant, the Avantis ABI has likely changed — surface a
+                // loud warning so we notice before bleeding more positions.
+                let is_close = ev.orderType != ORDER_TYPE_LIMIT_OPEN;
+                let heuristic_close = ev.t.openPrice != ev.price || pnl_pct != 0.0;
+                if is_close != heuristic_close {
+                    warn!(
+                        order_type = ev.orderType,
+                        is_pnl = ev.isPnl,
+                        is_close,
+                        heuristic_close,
+                        leader_open_price = %ev.t.openPrice,
+                        exec_price_raw = %ev.price,
+                        pct_profit = pnl_pct,
+                        %tx_hash,
+                        "LimitExecuted: orderType routing disagrees with price/pct heuristic — Avantis ABI may have changed"
+                    );
+                }
+
+                let intent = if is_close {
                     info!(
                         target: "intent",
-                        kind = "CLOSE", source = "keeper", order_type = ev.orderType,
-                        %symbol, exec_price, pnl_pct = pnl, block, %tx_hash,
+                        kind = "CLOSE", source = "keeper",
+                        order_type = ev.orderType, is_pnl = ev.isPnl,
+                        %symbol, exec_price, pnl_pct, block, %tx_hash,
                         "leader CLOSE (keeper)"
                     );
                     let Some((signal_id, leader_entry_price)) = record_close(
                         pool, trader_id, &symbol, pair_idx, pos_idx, exec_price, &tx_hash, block,
-                    ).await else { return };
+                    )
+                    .await
+                    else {
+                        return;
+                    };
                     TradeIntent::Close {
                         leader,
                         symbol,
@@ -213,21 +256,26 @@ async fn handle_log(
                         leader_exec_price: exec_price,
                         leader_entry_price,
                         // pnl is in percent (see MarketExecuted branch); /100 → fraction.
-                        leader_pnl_pct: Some(pnl / 100.0),
+                        leader_pnl_pct: Some(pnl_pct / 100.0),
                         source_tx: tx_hash.clone(),
                         signal_id,
                     }
                 } else {
                     info!(
                         target: "intent",
-                        kind = "OPEN", source = "keeper", order_type = ev.orderType,
+                        kind = "OPEN", source = "keeper",
+                        order_type = ev.orderType, is_pnl = ev.isPnl,
                         %symbol, %side, collateral, leverage, exec_price, block, %tx_hash,
                         "leader OPEN (keeper)"
                     );
                     let Some((symbol_id, signal_id)) = record_open(
-                        pool, trader_id, &symbol, side, pair_idx, pos_idx,
-                        collateral, leverage, exec_price, &tx_hash, block,
-                    ).await else { return };
+                        pool, trader_id, &symbol, side, pair_idx, pos_idx, collateral, leverage,
+                        exec_price, &tx_hash, block,
+                    )
+                    .await
+                    else {
+                        return;
+                    };
                     TradeIntent::Open {
                         leader,
                         symbol,
