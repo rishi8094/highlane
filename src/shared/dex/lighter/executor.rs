@@ -292,9 +292,11 @@ async fn handle_intent(
             let mut our_tx_hash: Option<String> = None;
 
             let actual_filled = if let Some(signer) = signer {
-                let pre_size = current_signed_size(client, account_index, market).await?;
+                let (pre_size, nonce) = tokio::try_join!(
+                    current_signed_size(client, account_index, market),
+                    client.next_nonce(account_index, cfg.api_key_index),
+                )?;
 
-                let nonce = client.next_nonce(account_index, cfg.api_key_index).await?;
                 let signed = signer.sign_create_order(
                     market.market_id,
                     client_order_id(),
