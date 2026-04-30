@@ -145,6 +145,14 @@ impl DiscordNotifier {
         self.spawn_send(build_startup_embed(&info));
     }
 
+    pub fn notify_watcher_disconnected(&self, reason: &str) {
+        self.spawn_send(build_watcher_disconnected_embed(reason));
+    }
+
+    pub fn notify_watcher_reconnected(&self, downtime_secs: u64) {
+        self.spawn_send(build_watcher_reconnected_embed(downtime_secs));
+    }
+
     /// Send a shutdown notification synchronously and wait for it to flush.
     /// Used on the exit path where a `tokio::spawn` would be torn down by the
     /// runtime shutting down before the request completes.
@@ -327,6 +335,41 @@ fn build_startup_embed(info: &StartupInfo) -> Value {
         "timestamp": Utc::now().to_rfc3339(),
     });
     json!({ "embeds": [embed] })
+}
+
+fn build_watcher_disconnected_embed(reason: &str) -> Value {
+    let embed = json!({
+        "title": "highlane watcher · DISCONNECTED",
+        "color": COLOR_LOSS,
+        "description": "Lost the Base WSS subscription. Auto-reconnecting in the background; trades may be missed until we're back.",
+        "fields": [
+            { "name": "Reason", "value": reason, "inline": false },
+        ],
+        "timestamp": Utc::now().to_rfc3339(),
+    });
+    json!({ "embeds": [embed] })
+}
+
+fn build_watcher_reconnected_embed(downtime_secs: u64) -> Value {
+    let embed = json!({
+        "title": "highlane watcher · RECONNECTED",
+        "color": COLOR_WIN,
+        "fields": [
+            { "name": "Downtime", "value": fmt_duration(downtime_secs), "inline": true },
+        ],
+        "timestamp": Utc::now().to_rfc3339(),
+    });
+    json!({ "embeds": [embed] })
+}
+
+fn fmt_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    }
 }
 
 fn build_unknown_close_embed(info: &UnknownClose) -> Value {

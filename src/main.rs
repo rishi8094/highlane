@@ -53,10 +53,24 @@ async fn main() -> eyre::Result<()> {
     let (tx, rx) = mpsc::channel::<TradeIntent>(256);
 
     let watcher_pool = pool.clone();
+    let watcher_notifier = notifier.clone();
     let watcher_handle = tokio::spawn(async move {
-        watcher::watch_leader(&ws_url, leader, trader_id, watcher_pool, tx).await
+        watcher::watch_leader(
+            &ws_url,
+            leader,
+            trader_id,
+            watcher_pool,
+            tx,
+            watcher_notifier,
+        )
+        .await
     });
     let exec_handle = tokio::spawn(run_executor(rx, cfg, pool, notifier.clone(), leader_lower));
+
+    // SIGTERM is what fly.io / docker / k8s send on graceful shutdown; SIGINT
+    // is Ctrl-C in local runs. Both should webhook before we exit.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| eyre::eyre!("failed to install SIGTERM handler: {e}"))?;
 
     let (which, reason, err): (&str, String, Option<eyre::Report>) = tokio::select! {
         r = watcher_handle => match r {
@@ -77,6 +91,12 @@ async fn main() -> eyre::Result<()> {
                 ("executor", format!("executor {kind}"), Some(eyre::eyre!("executor {kind}: {join_err}")))
             }
         },
+        _ = tokio::signal::ctrl_c() => {
+            ("signal", "received SIGINT".into(), None)
+        }
+        _ = sigterm.recv() => {
+            ("signal", "received SIGTERM".into(), None)
+        }
     };
 
     let fatal = err.is_some();

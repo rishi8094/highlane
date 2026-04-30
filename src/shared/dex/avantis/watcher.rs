@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alloy::{
     primitives::Address,
@@ -21,6 +21,7 @@ use super::pairs::load_pair_names;
 use crate::db::{DbPool, signals, symbols};
 use crate::shared::dex::Dex;
 use crate::shared::intent::{Side, TradeIntent};
+use crate::shared::notify::DiscordNotifier;
 
 const SOURCE_DEX: Dex = Dex::Avantis;
 
@@ -41,16 +42,48 @@ pub async fn watch_leader(
     trader_id: i32,
     pool: DbPool,
     tx: mpsc::Sender<TradeIntent>,
+    notifier: DiscordNotifier,
 ) -> ! {
     let mut backoff = BACKOFF_INITIAL;
+    // Fire "disconnected" only on the connected→disconnected edge, and
+    // "reconnected" only after we'd previously notified a disconnect — so
+    // we don't spam on every retry while still down, and the existing
+    // startup embed covers first connect.
+    let mut connected = false;
+    let mut disconnect_pending_reconnect = false;
+    let mut disconnected_at: Option<Instant> = None;
     loop {
-        match run_session(ws_url, leader, trader_id, &pool, &tx).await {
+        let result = run_session(
+            ws_url,
+            leader,
+            trader_id,
+            &pool,
+            &tx,
+            &notifier,
+            &mut connected,
+            &mut disconnect_pending_reconnect,
+            &mut disconnected_at,
+        )
+        .await;
+        let was_connected = connected;
+        connected = false;
+        match result {
             Ok(()) => {
                 warn!("subscription stream ended; reconnecting");
+                if was_connected {
+                    notifier.notify_watcher_disconnected("subscription stream ended");
+                    disconnect_pending_reconnect = true;
+                    disconnected_at = Some(Instant::now());
+                }
                 backoff = BACKOFF_INITIAL;
             }
             Err(e) => {
                 error!(error = ?e, backoff_secs = backoff.as_secs(), "watcher session failed");
+                if was_connected {
+                    notifier.notify_watcher_disconnected(&format!("{e}"));
+                    disconnect_pending_reconnect = true;
+                    disconnected_at = Some(Instant::now());
+                }
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(BACKOFF_MAX);
                 continue;
@@ -60,12 +93,17 @@ pub async fn watch_leader(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     ws_url: &str,
     leader: Address,
     trader_id: i32,
     pool: &DbPool,
     tx: &mpsc::Sender<TradeIntent>,
+    notifier: &DiscordNotifier,
+    connected: &mut bool,
+    disconnect_pending_reconnect: &mut bool,
+    disconnected_at: &mut Option<Instant>,
 ) -> Result<()> {
     info!(%leader, "connecting to Base WSS");
     let provider = ProviderBuilder::new()
@@ -92,6 +130,15 @@ async fn run_session(
 
     let sub = provider.subscribe_logs(&filter).await?;
     info!(%callbacks_addr, "subscribed to MarketExecuted + LimitExecuted logs");
+    *connected = true;
+    if *disconnect_pending_reconnect {
+        let downtime = disconnected_at
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        notifier.notify_watcher_reconnected(downtime);
+        *disconnect_pending_reconnect = false;
+        *disconnected_at = None;
+    }
 
     let mut stream = sub.into_stream();
     while let Some(log) = stream.next().await {
