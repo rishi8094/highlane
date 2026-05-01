@@ -11,7 +11,7 @@ use rustls::{ClientConfig, RootCertStore};
 use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::{error, info};
 
-const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
+const MIGRATIONS: EmbeddedMigrations = embed_migrations!("./migrations");
 
 pub type DbPool = Pool<AsyncPgConnection>;
 
