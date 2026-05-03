@@ -18,9 +18,12 @@ use crate::shared::notify::{
 
 const TARGET_DEX: Dex = Dex::Lighter;
 
-/// How long to wait after sendTx before snapshotting the post-fill position
-/// for delta computation. Lighter IOC market orders settle within hundreds of ms.
-const POST_FILL_DELAY: Duration = Duration::from_millis(750);
+/// Poll the post-fill position rather than waiting a fixed window: a single
+/// 750 ms sleep previously caused us to record `delta == 0` and drop the trade
+/// row when Lighter took longer than that to surface a fill via /api/v1/account,
+/// leaving an orphan position on the exchange (signal_id=781, 2026-05-03).
+const POST_FILL_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const POST_FILL_POLL_ATTEMPTS: u32 = 20;
 
 /// Capital utilisation alert thresholds. Each level fires one webhook when
 /// crossed and re-arms only after utilisation drops below its rearm point —
@@ -325,15 +328,18 @@ async fn handle_intent(
                 );
                 our_tx_hash = Some(resp.tx_hash);
 
-                tokio::time::sleep(POST_FILL_DELAY).await;
-                let post_size = current_signed_size(client, account_index, market).await?;
+                let post_size =
+                    poll_post_size_after_fill(client, account_index, market, pre_size).await?;
                 let delta = post_size - pre_size;
                 let expected_sign: i64 = if matches!(side, Side::Long) { 1 } else { -1 };
 
                 if delta == 0 {
                     warn!(
                         symbol = %symbol, market_id = market.market_id,
-                        "Lighter OPEN returned 0 fill; skipping state insert"
+                        pre_size, post_size,
+                        poll_interval_ms = POST_FILL_POLL_INTERVAL.as_millis() as u64,
+                        poll_attempts = POST_FILL_POLL_ATTEMPTS,
+                        "Lighter OPEN returned 0 fill after polling; skipping state insert (orphan risk if fill lands later)"
                     );
                     return Ok(());
                 }
@@ -635,6 +641,26 @@ async fn current_signed_size(
         market.market_id,
         market.size_decimals,
     ))
+}
+
+/// Poll the account snapshot until the position differs from `pre_size` or we
+/// exhaust `POST_FILL_POLL_ATTEMPTS`. Returns the last observed post-size; the
+/// caller is responsible for warn-logging if it still equals `pre_size`.
+async fn poll_post_size_after_fill(
+    client: &LighterClient,
+    account_index: i64,
+    market: &Market,
+    pre_size: i64,
+) -> Result<i64> {
+    let mut post_size = pre_size;
+    for _ in 0..POST_FILL_POLL_ATTEMPTS {
+        tokio::time::sleep(POST_FILL_POLL_INTERVAL).await;
+        post_size = current_signed_size(client, account_index, market).await?;
+        if post_size != pre_size {
+            return Ok(post_size);
+        }
+    }
+    Ok(post_size)
 }
 
 fn signed_size_for_market(
