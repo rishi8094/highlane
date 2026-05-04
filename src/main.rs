@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
-    let _log_guard = highlane::shared::observability::init()?;
+    let log_guard = highlane::shared::observability::init()?;
 
     let ws_url = std::env::var("BASE_WSS_URL")
         .map_err(|_| eyre::eyre!("BASE_WSS_URL not set (run via `doppler run -- cargo run`)"))?;
@@ -97,6 +97,7 @@ async fn main() -> eyre::Result<()> {
     let fatal = err.is_some();
     tracing::error!(component = which, %reason, fatal, "bot shutting down");
     notifier.notify_shutdown(&reason, fatal).await;
+    log_guard.flush().await;
 
     match err {
         Some(e) => Err(e),
