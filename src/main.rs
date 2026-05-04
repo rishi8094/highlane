@@ -5,15 +5,10 @@ use highlane::shared::dex::lighter::executor::{LighterConfig, run as run_executo
 use highlane::shared::intent::TradeIntent;
 use highlane::shared::notify::DiscordNotifier;
 use tokio::sync::mpsc;
-use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    let _log_guard = highlane::shared::observability::init()?;
 
     let ws_url = std::env::var("BASE_WSS_URL")
         .map_err(|_| eyre::eyre!("BASE_WSS_URL not set (run via `doppler run -- cargo run`)"))?;
