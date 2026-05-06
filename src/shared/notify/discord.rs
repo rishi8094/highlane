@@ -86,6 +86,49 @@ pub struct UnknownClose {
     pub leader_tx: String,
 }
 
+/// Fired when the bot discovers a position on Lighter that no longer matches
+/// the DB copy-state — either a CLOSE IOC failed to fill, partially filled,
+/// or startup reconciliation found a sign/magnitude mismatch. Always
+/// actionable: someone needs to inspect Lighter and the DB.
+#[derive(Debug, Clone)]
+pub struct OrphanAlert {
+    pub kind: OrphanKind,
+    pub symbol: String,
+    pub market_id: i32,
+    /// Signed integer size at the market's `size_decimals` scale that the DB
+    /// thinks should be on Lighter (positive=long, negative=short, 0=flat).
+    pub expected_signed_size: i64,
+    /// Same scale — what Lighter actually reports.
+    pub actual_signed_size: i64,
+    /// Human-readable extra context (e.g. leader tx hash, partial fill amount).
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanKind {
+    /// IOC reduce-only CLOSE was sent but post-fill polling showed no change
+    /// in our Lighter position.
+    CloseUnfilled,
+    /// IOC reduce-only CLOSE filled less than the DB's open `size`. The
+    /// residual position is still live on Lighter; we shrunk the DB row.
+    ClosePartialFill,
+    /// Startup reconciliation found `state_size != lighter_size` (different
+    /// magnitudes or sign flip) for a market both sides know about.
+    ReconcileDrift,
+    /// Replayed leader OPEN log whose `signals` row already exists but has
+    /// no matching `trades` row. Could be (a) executor crashed before
+    /// send_tx — leader trade silently missed, or (b) executor crashed
+    /// after send_tx but before record_open committed — Lighter holds a
+    /// position we never recorded. We can't tell the two apart without
+    /// risking a duplicate IOC, so we always skip the replay and alert.
+    ReplayMirrorMissing,
+    /// Backfill `eth_getLogs` failed (range too large, RPC error, etc.)
+    /// while we were trying to recover from an outage. Whatever leader
+    /// events fired in the failed window are not recoverable from this
+    /// session — operator needs to inspect Lighter and decide.
+    BackfillFailed,
+}
+
 #[derive(Debug, Clone)]
 pub struct StartupInfo {
     pub leader_address: String,
@@ -139,6 +182,10 @@ impl DiscordNotifier {
 
     pub fn notify_unknown_close(&self, info: UnknownClose) {
         self.spawn_send(build_unknown_close_embed(&info));
+    }
+
+    pub fn notify_orphan(&self, info: OrphanAlert) {
+        self.spawn_send(build_orphan_embed(&info));
     }
 
     pub fn notify_startup(&self, info: StartupInfo) {
@@ -395,6 +442,35 @@ fn build_unknown_close_embed(info: &UnknownClose) -> Value {
             { "name": "Leader close", "value": fmt_usd(info.leader_close_price), "inline": true },
             { "name": "Leader PnL", "value": leader_pnl, "inline": true },
             { "name": "Leader tx", "value": tx_field, "inline": false },
+        ],
+        "timestamp": Utc::now().to_rfc3339(),
+    });
+    json!({ "embeds": [embed] })
+}
+
+fn build_orphan_embed(info: &OrphanAlert) -> Value {
+    let (prefix, headline) = match info.kind {
+        OrphanKind::CloseUnfilled => ("⚠", "CLOSE didn't fill"),
+        OrphanKind::ClosePartialFill => ("⚠", "CLOSE partially filled"),
+        OrphanKind::ReconcileDrift => ("🚨", "DRIFT detected at startup"),
+        OrphanKind::ReplayMirrorMissing => ("🚨", "Replay: signal without follower trade"),
+        OrphanKind::BackfillFailed => ("🚨", "Backfill failed — possible missed leader events"),
+    };
+    let description = match info.kind {
+        OrphanKind::ReplayMirrorMissing => "A replayed leader OPEN has a `signals` row but no `trades` row. The previous run crashed mid-mirror — either the IOC was never sent (missed mirror), or it was sent and Lighter holds a position the DB never recorded. We did NOT re-fire; check Lighter for an unrecorded position and reconcile manually.",
+        OrphanKind::BackfillFailed => "Could not replay leader logs from the offline window. Any OPEN/CLOSE events the leader fired in the failed range are not recoverable from this session — inspect Lighter for unmirrored positions.",
+        _ => "Copy-state and Lighter disagree. Inspect manually with `cargo run --bin fix_drift list`; close any orphan position on Lighter directly.",
+    };
+    let title = format!("{prefix} {} · {}", headline, info.symbol);
+    let embed = json!({
+        "title": title,
+        "color": COLOR_AMBER,
+        "description": description,
+        "fields": [
+            { "name": "Market", "value": format!("{} (id {})", info.symbol, info.market_id), "inline": true },
+            { "name": "DB expects", "value": info.expected_signed_size.to_string(), "inline": true },
+            { "name": "Lighter has", "value": info.actual_signed_size.to_string(), "inline": true },
+            { "name": "Note", "value": if info.note.is_empty() { "—".into() } else { info.note.clone() }, "inline": false },
         ],
         "timestamp": Utc::now().to_rfc3339(),
     });

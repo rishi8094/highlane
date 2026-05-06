@@ -12,8 +12,8 @@ use crate::db::{DbPool, trades};
 use crate::shared::dex::Dex;
 use crate::shared::intent::{Side, TradeIntent};
 use crate::shared::notify::{
-    CloseFill, DiscordNotifier, OpenFill, StartupInfo, UnknownClose, UtilisationAlert,
-    UtilisationSeverity,
+    CloseFill, DiscordNotifier, OpenFill, OrphanAlert, OrphanKind, StartupInfo, UnknownClose,
+    UtilisationAlert, UtilisationSeverity,
 };
 
 const TARGET_DEX: Dex = Dex::Lighter;
@@ -149,8 +149,15 @@ pub async fn run(
         "executor ready"
     );
 
-    if let Err(e) =
-        reconcile_on_startup(&client, &markets, &pool, &open_trades, account_index).await
+    if let Err(e) = reconcile_on_startup(
+        &client,
+        &markets,
+        &pool,
+        &open_trades,
+        account_index,
+        &notifier,
+    )
+    .await
     {
         warn!(error = ?e, "startup reconciliation failed; continuing with current state as-is");
     }
@@ -475,8 +482,19 @@ async fn handle_intent(
                 "sending Lighter market IOC CLOSE (reduce-only)"
             );
 
-            let close_tx_hash: Option<String> = if let Some(signer) = signer {
-                let nonce = client.next_nonce(account_index, cfg.api_key_index).await?;
+            // Track how much of `open.size` we actually closed on Lighter.
+            // - dry-run: pretend we closed everything.
+            // - live: poll signed-size before/after to compute the real
+            //   reduction. If it didn't move, leave the DB row open so the
+            //   next leader CLOSE / startup reconciliation can catch it.
+            //   Without this, a non-crossing IOC silently orphans the
+            //   position on Lighter (signal_id ≈ 1100, BTC/USD 2026-05-05).
+            let (close_tx_hash, actual_closed): (Option<String>, i64) = if let Some(signer) = signer
+            {
+                let (pre_size, nonce) = tokio::try_join!(
+                    current_signed_size(client, account_index, market),
+                    client.next_nonce(account_index, cfg.api_key_index),
+                )?;
                 let signed = signer.sign_create_order(
                     open.market_id,
                     client_order_id(),
@@ -499,11 +517,79 @@ async fn handle_intent(
                     ));
                 }
                 info!(target: "execute", tx_hash = %resp.tx_hash, "Lighter accepted CLOSE");
-                Some(resp.tx_hash)
+
+                let post_size =
+                    poll_post_size_after_fill(client, account_index, market, pre_size).await?;
+                // Reduce-only IOC can only shrink the magnitude of the
+                // position (or do nothing). Compute by comparing absolute
+                // sizes so we are robust to the side, and clamp to >=0 in
+                // case Lighter's snapshot transiently disagrees.
+                let closed = (pre_size.unsigned_abs() as i64)
+                    .saturating_sub(post_size.unsigned_abs() as i64)
+                    .max(0);
+                (Some(resp.tx_hash), closed)
             } else {
                 info!(target: "execute", dry_run = true, "[DRY] would send CLOSE");
-                None
+                (None, open.size)
             };
+
+            if actual_closed == 0 {
+                warn!(
+                    %symbol, market_id = open.market_id, requested = open.size,
+                    "Lighter CLOSE returned 0 fill after polling; leaving DB row open (orphan risk if fill lands later)"
+                );
+                if notifier.enabled() {
+                    notifier.notify_orphan(OrphanAlert {
+                        kind: OrphanKind::CloseUnfilled,
+                        symbol: symbol.clone(),
+                        market_id: open.market_id,
+                        expected_signed_size: match open.side {
+                            Side::Long => open.size,
+                            Side::Short => -open.size,
+                        },
+                        actual_signed_size: match open.side {
+                            Side::Long => open.size,
+                            Side::Short => -open.size,
+                        },
+                        note: format!(
+                            "leader_tx={} signal_id={} requested_size={}",
+                            source_tx, signal_id, open.size
+                        ),
+                    });
+                }
+                return Ok(());
+            }
+
+            if actual_closed < open.size {
+                let residual = open.size - actual_closed;
+                info!(
+                    target: "execute",
+                    %symbol, market_id = open.market_id,
+                    requested = open.size, closed = actual_closed, residual,
+                    "partial close on Lighter CLOSE — recording residual; DB row stays open"
+                );
+                trades::reduce_open_size(pool, open.id, residual).await?;
+                if notifier.enabled() {
+                    notifier.notify_orphan(OrphanAlert {
+                        kind: OrphanKind::ClosePartialFill,
+                        symbol: symbol.clone(),
+                        market_id: open.market_id,
+                        expected_signed_size: match open.side {
+                            Side::Long => residual,
+                            Side::Short => -residual,
+                        },
+                        actual_signed_size: match open.side {
+                            Side::Long => residual,
+                            Side::Short => -residual,
+                        },
+                        note: format!(
+                            "leader_tx={} signal_id={} requested={} closed={} residual={}",
+                            source_tx, signal_id, open.size, actual_closed, residual
+                        ),
+                    });
+                }
+                return Ok(());
+            }
 
             trades::record_close(
                 pool,
@@ -681,6 +767,7 @@ async fn reconcile_on_startup(
     pool: &DbPool,
     open_trades: &[crate::db::models::Trade],
     account_index: i64,
+    notifier: &DiscordNotifier,
 ) -> Result<()> {
     let det = client.account(account_index).await?;
 
@@ -702,6 +789,13 @@ async fn reconcile_on_startup(
             .map(|m| m.size_decimals)
             .unwrap_or(0)
     };
+    let symbol_for_market = |mid: i32| -> String {
+        markets
+            .values()
+            .find(|m| m.market_id == mid)
+            .map(|m| m.symbol.clone())
+            .unwrap_or_else(|| format!("#{mid}"))
+    };
 
     let mut market_ids: HashSet<i32> = state_by_market.keys().copied().collect();
     market_ids.extend(det.positions.iter().map(|p| p.market_id));
@@ -718,6 +812,16 @@ async fn reconcile_on_startup(
                 lighter_size,
                 "ORPHAN: Lighter holds a position not in copy-state. Not auto-closing — review manually."
             );
+            if notifier.enabled() {
+                notifier.notify_orphan(OrphanAlert {
+                    kind: OrphanKind::ReconcileDrift,
+                    symbol: symbol_for_market(mid),
+                    market_id: mid,
+                    expected_signed_size: 0,
+                    actual_signed_size: lighter_size,
+                    note: "ORPHAN at startup: Lighter has a position the DB does not — close on Lighter manually".into(),
+                });
+            }
         } else if state_size != 0 && lighter_size == 0 {
             warn!(
                 market_id = mid,
@@ -726,12 +830,54 @@ async fn reconcile_on_startup(
             );
             markets_to_drop.push(mid);
         } else if state_size != lighter_size {
-            warn!(
-                market_id = mid,
-                state_size,
-                lighter_size,
-                "DRIFT: copy-state and Lighter sizes differ but neither is 0 — leaving state alone."
-            );
+            // Sign flip or magnitude mismatch — both sides hold a position
+            // but they disagree, so we cannot trust DB-side `size` as the
+            // basis for any subsequent CLOSE sizing. Fail the DB rows for
+            // this market (clears copy-state) and surface the residual
+            // Lighter position as an orphan that needs manual review.
+            //
+            // BUT: AccountPosition.signed_base_int parses Lighter's decimal
+            // string through f64 then `.round() as i64`, which can produce
+            // ±1-unit noise at the smallest size_decimals bit. We tolerate
+            // ≤ 2 same-sign units to avoid alarming on that float jitter
+            // and nothing more — partial OPEN fills are already recorded
+            // as the actual filled amount in the DB, so any residual past
+            // float noise is real drift, not legitimate slack. A wider
+            // percentage tolerance would silently leave orphan units on
+            // Lighter after the leader's next close (a 1000-vs-1004 row
+            // reduces by 1000 and strands the extra 4 forever).
+            const DRIFT_TOLERANCE_UNITS: u64 = 2;
+            let same_sign = state_size.signum() == lighter_size.signum();
+            let diff = state_size.abs_diff(lighter_size); // u64
+            if same_sign && diff <= DRIFT_TOLERANCE_UNITS {
+                info!(
+                    market_id = mid,
+                    state_size,
+                    lighter_size,
+                    diff,
+                    "reconciled OK (within float-rounding tolerance)"
+                );
+            } else {
+                warn!(
+                    market_id = mid,
+                    state_size,
+                    lighter_size,
+                    diff,
+                    tolerance = DRIFT_TOLERANCE_UNITS,
+                    "DRIFT: copy-state and Lighter sizes differ — failing state for this market and surfacing orphan."
+                );
+                markets_to_drop.push(mid);
+                if notifier.enabled() {
+                    notifier.notify_orphan(OrphanAlert {
+                        kind: OrphanKind::ReconcileDrift,
+                        symbol: symbol_for_market(mid),
+                        market_id: mid,
+                        expected_signed_size: state_size,
+                        actual_signed_size: lighter_size,
+                        note: "DRIFT at startup: DB rows failed; Lighter still holds the residual — close manually if undesired".into(),
+                    });
+                }
+            }
         } else {
             info!(market_id = mid, size = lighter_size, "reconciled OK");
         }

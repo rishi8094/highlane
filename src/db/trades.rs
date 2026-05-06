@@ -46,6 +46,23 @@ pub async fn record_open(
     Ok(id)
 }
 
+/// True iff any `trades` row exists for `signal_id` (open or closed). Used by
+/// the watcher to decide whether a replayed leader OPEN log should re-emit
+/// the intent: if a trade row already exists, the executor has already
+/// fired and recorded the mirroring IOC, so re-emitting would duplicate the
+/// position. If no trade row exists, the original intent never made it
+/// through the executor (crash before send, channel closure, etc.), and we
+/// should re-mirror.
+pub async fn any_for_signal(pool: &DbPool, signal_id: i32) -> Result<bool> {
+    let mut conn = pool.get().await?;
+    let n: i64 = trades::table
+        .filter(trades::signal_id.eq(signal_id))
+        .count()
+        .get_result(&mut conn)
+        .await?;
+    Ok(n > 0)
+}
+
 /// Look up the most recent open trade for a given signal. There should be at
 /// most one; if there's drift we still take the newest.
 pub async fn find_open_for_signal(pool: &DbPool, signal_id: i32) -> Result<Option<Trade>> {
@@ -80,6 +97,26 @@ pub async fn record_close(
         trades::exit_tx.eq(exit_tx),
         trades::exit_at.eq(Some(now)),
     ))
+    .execute(&mut conn)
+    .await?;
+    Ok(())
+}
+
+/// Shrink an open trade's `size` to `new_size` in place, leaving `exit_at`
+/// NULL. Used when a Lighter reduce-only IOC partially fills a CLOSE: the
+/// Lighter position still holds the residual, so the DB row must continue to
+/// represent that residual until a subsequent CLOSE finishes the job (or
+/// reconciliation cleans it up). Only updates rows that are still open and
+/// whose new size is strictly smaller and positive.
+pub async fn reduce_open_size(pool: &DbPool, trade_id: i32, new_size: i64) -> Result<()> {
+    let mut conn = pool.get().await?;
+    diesel::update(
+        trades::table
+            .filter(trades::id.eq(trade_id))
+            .filter(trades::exit_at.is_null())
+            .filter(trades::size.gt(new_size)),
+    )
+    .set(trades::size.eq(new_size))
     .execute(&mut conn)
     .await?;
     Ok(())
