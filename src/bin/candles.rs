@@ -29,6 +29,7 @@ enum Venue {
     Avantis,
     Hyperliquid,
     Ostium,
+    Aster,
 }
 
 impl Venue {
@@ -38,6 +39,7 @@ impl Venue {
             Venue::Avantis => "avantis",
             Venue::Hyperliquid => "hyperliquid",
             Venue::Ostium => "ostium",
+            Venue::Aster => "aster",
         }
     }
     fn parse(s: &str) -> Result<Self> {
@@ -46,11 +48,18 @@ impl Venue {
             "avantis" => Ok(Venue::Avantis),
             "hyperliquid" | "hl" => Ok(Venue::Hyperliquid),
             "ostium" => Ok(Venue::Ostium),
+            "aster" => Ok(Venue::Aster),
             _ => Err(eyre!("unknown venue: {s}")),
         }
     }
     fn all() -> Vec<Venue> {
-        vec![Venue::Lighter, Venue::Avantis, Venue::Hyperliquid, Venue::Ostium]
+        vec![
+            Venue::Lighter,
+            Venue::Avantis,
+            Venue::Hyperliquid,
+            Venue::Ostium,
+            Venue::Aster,
+        ]
     }
 }
 
@@ -209,7 +218,7 @@ fn parse_args() -> Result<Args> {
 fn print_help() {
     eprintln!(
         "Usage: candles [options]
-  --venues <list>      lighter,avantis,hyperliquid,ostium  (default: all)
+  --venues <list>      lighter,avantis,hyperliquid,ostium,aster  (default: all)
   --symbols <list>     BTC,ETH                              (default: BTC,ETH)
   --from <ts>          ISO8601 or unix seconds              (default: 24h ago)
   --to <ts>            ISO8601 or unix seconds              (default: now)
@@ -267,6 +276,7 @@ async fn fetch(venue: Venue, sym: &str, args: &Args, http: &Http) -> Outcome {
         Venue::Avantis => fetch_avantis(http, sym, args).await,
         Venue::Hyperliquid => fetch_hyperliquid(http, sym, args).await,
         Venue::Ostium => fetch_ostium(http, sym, args).await,
+        Venue::Aster => fetch_aster(http, sym, args).await,
     };
     match res {
         Ok(body) => match fs::write(&path, &body) {
@@ -518,6 +528,69 @@ async fn fetch_ostium(http: &Http, sym: &str, args: &Args) -> Result<String> {
     Ok(serde_json::to_string(
         &json!({ "data": Value::Array(arr) }),
     )?)
+}
+
+// ───────────── Aster ───────────────────────────────────────────────────────
+fn aster_symbol(sym: &str) -> String {
+    format!("{sym}USDT")
+}
+async fn fetch_aster(http: &Http, sym: &str, args: &Args) -> Result<String> {
+    // Binance-Futures-compatible klines API: limit caps at 1000 per call and
+    // rows are returned ascending by openTime, so we page forward from `from`
+    // toward `to` and dedup by openTime (row[0]).
+    let hi_ms = args.to_unix * 1000;
+    let mut cursor_start_ms = args.from_unix * 1000;
+    let mut all: std::collections::BTreeMap<i64, Value> = Default::default();
+    let mut page = 0;
+    while cursor_start_ms < hi_ms {
+        page += 1;
+        if page > 20 {
+            break;
+        }
+        let url = format!(
+            "https://www.asterdex.com/fapi/v1/klines?symbol={}&interval={}&contractType=PERPETUAL&startTime={}&endTime={}&limit=1000",
+            aster_symbol(sym),
+            args.resolution,
+            cursor_start_ms,
+            hi_ms,
+        );
+        let resp = http
+            .get(&url)
+            .header("Origin", "https://www.asterdex.com")
+            .header("Referer", "https://www.asterdex.com/")
+            .send()
+            .await?;
+        let status = resp.status();
+        let raw = resp.text().await?;
+        if !status.is_success() {
+            return Err(eyre!(
+                "aster HTTP {status} page {page}; head: {}",
+                &raw[..raw.len().min(200)]
+            ));
+        }
+        let rows: Vec<Value> = serde_json::from_str(&raw).with_context(|| {
+            format!("decode aster page {page}; head: {}", &raw[..raw.len().min(200)])
+        })?;
+        if rows.is_empty() {
+            break;
+        }
+        let n = rows.len();
+        let mut max_t = i64::MIN;
+        for c in rows {
+            if let Some(t) = c.get(0).and_then(|x| x.as_i64()) {
+                if t > max_t {
+                    max_t = t;
+                }
+                all.insert(t, c);
+            }
+        }
+        if n < 1000 || max_t == i64::MIN {
+            break;
+        }
+        cursor_start_ms = max_t + 1;
+    }
+    let arr: Vec<Value> = all.into_values().collect();
+    Ok(serde_json::to_string_pretty(&Value::Array(arr))?)
 }
 
 #[allow(dead_code)]
