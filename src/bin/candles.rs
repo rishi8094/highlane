@@ -387,34 +387,71 @@ fn hl_resolution(args: &Args) -> String {
     }
 }
 async fn fetch_hyperliquid(http: &Http, sym: &str, args: &Args) -> Result<String> {
-    let body = json!({
-        "type": "candleSnapshot",
-        "req": {
-            "coin": sym,
-            "interval": hl_resolution(args),
-            "startTime": args.from_unix * 1000,
-            "endTime": args.to_unix * 1000,
+    // Hyperliquid's `candleSnapshot` caps responses at ~5000 candles per
+    // call. At 1m that's only ~3.5 days, so for any window wider than that
+    // we have to page back from `to` toward `from`, dedup by `t`, and stitch.
+    let interval = hl_resolution(args);
+    let lo_ms = args.from_unix * 1000;
+    let mut cursor_end_ms = args.to_unix * 1000;
+    let mut all: std::collections::BTreeMap<i64, Value> = Default::default();
+    let mut page = 0;
+    while cursor_end_ms > lo_ms {
+        page += 1;
+        if page > 20 {
+            break;
         }
-    });
-    let resp = http
-        .post("https://api-ui.hyperliquid.xyz/info")
-        .header("content-type", "application/json")
-        .header("origin", "https://app.hyperliquid.xyz")
-        .header("referer", "https://app.hyperliquid.xyz/")
-        .body(serde_json::to_string(&body)?)
-        .send()
-        .await?;
-    let status = resp.status();
-    let raw = resp.text().await?;
-    if !status.is_success() {
-        return Err(eyre!(
-            "hyperliquid HTTP {status}; head: {}",
-            &raw[..raw.len().min(200)]
-        ));
+        let body = json!({
+            "type": "candleSnapshot",
+            "req": {
+                "coin": sym,
+                "interval": &interval,
+                "startTime": lo_ms,
+                "endTime": cursor_end_ms,
+            }
+        });
+        let resp = http
+            .post("https://api-ui.hyperliquid.xyz/info")
+            .header("content-type", "application/json")
+            .header("origin", "https://app.hyperliquid.xyz")
+            .header("referer", "https://app.hyperliquid.xyz/")
+            .body(serde_json::to_string(&body)?)
+            .send()
+            .await?;
+        let status = resp.status();
+        let raw = resp.text().await?;
+        if !status.is_success() {
+            return Err(eyre!(
+                "hyperliquid HTTP {status}; head: {}",
+                &raw[..raw.len().min(200)]
+            ));
+        }
+        let candles: Vec<Value> = serde_json::from_str(&raw).with_context(|| {
+            format!("decode hl page {page}; head: {}", &raw[..raw.len().min(200)])
+        })?;
+        if candles.is_empty() {
+            break;
+        }
+        let mut min_t = i64::MAX;
+        let mut added = 0_usize;
+        for c in candles {
+            if let Some(t) = c.get("t").and_then(|x| x.as_i64()) {
+                if t < min_t {
+                    min_t = t;
+                }
+                if all.insert(t, c).is_none() {
+                    added += 1;
+                }
+            }
+        }
+        // If a page returned only candles we already have (no progress) or
+        // its earliest candle is already at/before our window start, we're done.
+        if added == 0 || min_t == i64::MAX || min_t <= lo_ms {
+            break;
+        }
+        cursor_end_ms = min_t - 1;
     }
-    let _: Value = serde_json::from_str(&raw)
-        .with_context(|| format!("decode hl; head: {}", &raw[..raw.len().min(200)]))?;
-    Ok(raw)
+    let arr: Vec<Value> = all.into_values().collect();
+    Ok(serde_json::to_string_pretty(&Value::Array(arr))?)
 }
 
 // ───────────── Ostium ──────────────────────────────────────────────────────
@@ -422,33 +459,65 @@ fn ostium_asset(sym: &str) -> String {
     format!("{sym}USD")
 }
 async fn fetch_ostium(http: &Http, sym: &str, args: &Args) -> Result<String> {
-    let body = json!({
-        "asset": ostium_asset(sym),
-        "resolution": args.resolution_minutes.to_string(),
-        "fromTimestampSeconds": args.from_unix,
-        "toTimestampSeconds": args.to_unix,
-    });
-    let resp = http
-        .post("https://history.ostium.io/ohlc/getHistorical")
-        .header("authorization", OSTIUM_AUTH)
-        .header("content-type", "application/json")
-        .header("origin", "https://app.ostium.com")
-        .header("referer", "https://app.ostium.com/")
-        .body(serde_json::to_string(&body)?)
-        .send()
-        .await?;
-    let status = resp.status();
-    let raw = resp.text().await?;
-    // Ostium returns 201 on success.
-    if !(200..300).contains(&status.as_u16()) {
-        return Err(eyre!(
-            "ostium HTTP {status}; head: {}",
-            &raw[..raw.len().min(200)]
-        ));
+    // Ostium caps the number of candles per request ("Too many candles
+    // requested" 400). Chunk the request to stay well under whatever the
+    // cap is — target ~1500 candles per page, which works at any resolution
+    // we care about.
+    let target_candles_per_page: i64 = 1500;
+    let chunk_secs: i64 = target_candles_per_page * args.resolution_minutes as i64 * 60;
+    let mut all: std::collections::BTreeMap<i64, Value> = Default::default();
+    let mut cursor_from = args.from_unix;
+    let mut page = 0;
+    while cursor_from < args.to_unix {
+        page += 1;
+        if page > 30 {
+            return Err(eyre!("ostium pagination cap (30 pages) hit"));
+        }
+        let cursor_to = (cursor_from + chunk_secs).min(args.to_unix);
+        let body = json!({
+            "asset": ostium_asset(sym),
+            "resolution": args.resolution_minutes.to_string(),
+            "fromTimestampSeconds": cursor_from,
+            "toTimestampSeconds": cursor_to,
+        });
+        let resp = http
+            .post("https://history.ostium.io/ohlc/getHistorical")
+            .header("authorization", OSTIUM_AUTH)
+            .header("content-type", "application/json")
+            .header("origin", "https://app.ostium.com")
+            .header("referer", "https://app.ostium.com/")
+            .body(serde_json::to_string(&body)?)
+            .send()
+            .await?;
+        let status = resp.status();
+        let raw = resp.text().await?;
+        if !(200..300).contains(&status.as_u16()) {
+            return Err(eyre!(
+                "ostium HTTP {status} page {page} (from={cursor_from} to={cursor_to}); head: {}",
+                &raw[..raw.len().min(200)]
+            ));
+        }
+        let v: Value = serde_json::from_str(&raw).with_context(|| {
+            format!(
+                "decode ostium page {page}; head: {}",
+                &raw[..raw.len().min(200)]
+            )
+        })?;
+        if let Some(arr) = v.get("data").and_then(|x| x.as_array()) {
+            for c in arr {
+                if let Some(t) = c.get("time").and_then(|x| x.as_i64()) {
+                    all.insert(t, c.clone());
+                }
+            }
+        }
+        cursor_from = cursor_to;
     }
-    let _: Value = serde_json::from_str(&raw)
-        .with_context(|| format!("decode ostium; head: {}", &raw[..raw.len().min(200)]))?;
-    Ok(raw)
+    // Re-emit in the original shape `{"data": [...]}` so downstream parsers
+    // don't need to change.
+    let arr: Vec<Value> = all.into_values().collect();
+    Ok(serde_json::to_string(
+        &json!({ "data": Value::Array(arr) }),
+    )?)
 }
 
 #[allow(dead_code)]
