@@ -34,6 +34,19 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// page — long outages are recovered by paging through multiple chunks.
 const BACKFILL_PAGE_BLOCKS: u64 = 1500;
 
+/// Max time we'll wait on `stream.next()` before assuming the WS log
+/// subscription is silently dead and forcing a reconnect. alloy's WS
+/// transport reconnects the underlying socket transparently, but the
+/// server-side log subscription does NOT survive that reconnect — the
+/// stream just stops yielding forever (the 2026-05-13/14 15-hour blackout
+/// where the watcher saw zero leader events while the chain kept producing
+/// them). On expiry we return Err; the outer loop re-enters `run_session`,
+/// which re-subscribes AND replays `eth_getLogs` from `last_seen_block`,
+/// so any leader events that fired during the silent window are caught up
+/// idempotently. False positives during legitimately-quiet stretches just
+/// cost one extra paged `get_logs` and are harmless.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
 /// Outcome of `handle_log`. The watcher loop uses this to decide whether to
 /// advance the block cursor: only `Ingested` and `Irrelevant` are safe to
 /// advance past. A `Failed` log means a downstream write (DB or intent
@@ -299,19 +312,38 @@ async fn run_session(
     }
 
     let mut stream = sub.into_stream();
-    while let Some(log) = stream.next().await {
-        let status = handle_log(&log, leader, trader_id, pool, &pairs, tx, notifier).await;
-        if matches!(status, HandleStatus::Failed) {
-            cursor_locked = true;
-        }
-        if !cursor_locked
-            && let Some(b) = log.block_number
-            && b > last_seen_block.unwrap_or(0)
-        {
-            *last_seen_block = Some(b);
+    loop {
+        match tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()).await {
+            Ok(Some(log)) => {
+                let status =
+                    handle_log(&log, leader, trader_id, pool, &pairs, tx, notifier).await;
+                if matches!(status, HandleStatus::Failed) {
+                    cursor_locked = true;
+                }
+                if !cursor_locked
+                    && let Some(b) = log.block_number
+                    && b > last_seen_block.unwrap_or(0)
+                {
+                    *last_seen_block = Some(b);
+                }
+            }
+            Ok(None) => {
+                warn!("WS log stream returned None — subscription ended");
+                return Ok(());
+            }
+            Err(_) => {
+                warn!(
+                    timeout_secs = STREAM_IDLE_TIMEOUT.as_secs(),
+                    last_seen_block = ?*last_seen_block,
+                    "WS log subscription idle past timeout — forcing reconnect so backfill replays any missed range"
+                );
+                return Err(eyre::eyre!(
+                    "WS subscription idle past {}s — forcing reconnect",
+                    STREAM_IDLE_TIMEOUT.as_secs()
+                ));
+            }
         }
     }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
