@@ -140,6 +140,22 @@ pub struct StartupInfo {
     pub dry_run: bool,
 }
 
+/// Fired by the shadow poller when its idempotent re-fetch of recent
+/// blocks ingests events the primary WS subscription never delivered.
+/// Each occurrence is a concrete dropped-tx count plus a few sample
+/// `tx_hash`es operators can use to spot-check on-chain. The shadow
+/// has already replayed the missed events through the normal handler
+/// by the time this fires, so the position state is already catching
+/// up — the alert is for visibility / RPC-health tracking, not a
+/// call to action.
+#[derive(Debug, Clone)]
+pub struct DroppedEvents {
+    pub count: u32,
+    pub from_block: u64,
+    pub to_block: u64,
+    pub samples: Vec<String>,
+}
+
 #[derive(Clone)]
 pub struct DiscordNotifier {
     inner: Arc<Inner>,
@@ -198,6 +214,10 @@ impl DiscordNotifier {
 
     pub fn notify_watcher_reconnected(&self, downtime_secs: u64) {
         self.spawn_send(build_watcher_reconnected_embed(downtime_secs));
+    }
+
+    pub fn notify_dropped_events(&self, info: DroppedEvents) {
+        self.spawn_send(build_dropped_events_embed(&info));
     }
 
     /// Send a shutdown notification synchronously and wait for it to flush.
@@ -403,6 +423,31 @@ fn build_watcher_reconnected_embed(downtime_secs: u64) -> Value {
         "color": COLOR_WIN,
         "fields": [
             { "name": "Downtime", "value": fmt_duration(downtime_secs), "inline": true },
+        ],
+        "timestamp": Utc::now().to_rfc3339(),
+    });
+    json!({ "embeds": [embed] })
+}
+
+fn build_dropped_events_embed(info: &DroppedEvents) -> Value {
+    let title = format!("⚠ Shadow poller caught {} dropped event(s)", info.count);
+    let samples_field = if info.samples.is_empty() {
+        "—".to_string()
+    } else {
+        info.samples
+            .iter()
+            .map(|h| format!("`{}`", truncate_tx(h)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let embed = json!({
+        "title": title,
+        "color": COLOR_AMBER,
+        "description": "The WS log subscription delivered fewer events than the chain produced. The shadow poller re-fetched the range via `eth_getLogs` and ingested the missing logs idempotently, so copy-state is catching up. Sustained non-zero counts here mean the WS path is unreliable and we should consider switching to polling-primary.",
+        "fields": [
+            { "name": "Dropped count", "value": info.count.to_string(), "inline": true },
+            { "name": "Block range", "value": format!("{}–{}", info.from_block, info.to_block), "inline": true },
+            { "name": "Sample tx hashes", "value": samples_field, "inline": false },
         ],
         "timestamp": Utc::now().to_rfc3339(),
     });

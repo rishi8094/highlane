@@ -21,7 +21,7 @@ use super::pairs::load_pair_names;
 use crate::db::{DbPool, signals, symbols, trades};
 use crate::shared::dex::Dex;
 use crate::shared::intent::{Side, TradeIntent};
-use crate::shared::notify::{DiscordNotifier, OrphanAlert, OrphanKind};
+use crate::shared::notify::{DiscordNotifier, DroppedEvents, OrphanAlert, OrphanKind};
 
 const SOURCE_DEX: Dex = Dex::Avantis;
 
@@ -47,16 +47,46 @@ const BACKFILL_PAGE_BLOCKS: u64 = 1500;
 /// cost one extra paged `get_logs` and are harmless.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
+/// How often the shadow poller re-fetches recent blocks via `eth_getLogs`
+/// and feeds them through the same idempotent `handle_log` path the WS
+/// subscription uses. Each tick produces one `eth_getLogs` over
+/// `SHADOW_POLL_LOOKBACK_BLOCKS` of history.
+const SHADOW_POLL_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How far back the shadow poller looks every tick. Sized for Base's ~2s
+/// block time so we always overlap the prior window by ≥ one full tick of
+/// chain time — that way a log emitted right before we read `head` can't
+/// slip between two consecutive shadow ticks. `handle_log` is idempotent,
+/// so the overlap costs only a few extra DB reads per tick.
+const SHADOW_POLL_LOOKBACK_BLOCKS: u64 = 150;
+
+/// Lower bound on the gap between consecutive `notify_dropped_events`
+/// Discord embeds when drops are sustained. The shadow path keeps
+/// ingesting and logging on every tick; this just rate-limits the
+/// webhook so a multi-hour outage doesn't fire a Discord embed every
+/// 30 seconds.
+const DROPPED_EVENTS_NOTIFY_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+
 /// Outcome of `handle_log`. The watcher loop uses this to decide whether to
 /// advance the block cursor: only `Ingested` and `Irrelevant` are safe to
 /// advance past. A `Failed` log means a downstream write (DB or intent
 /// channel) errored and we want the next session/backfill to re-deliver the
 /// log, so the cursor must stay where it was.
+///
+/// `was_new` on `Ingested` distinguishes "this call was the one to record
+/// the event into the DB" (true) from "the row was already there, e.g. a
+/// re-delivered log or an event the WS path beat us to" (false). The
+/// shadow poller uses `was_new=true` from its own re-fetch of recent
+/// blocks as the definitive "the WS subscription dropped this event"
+/// signal — anything the WS already ingested shows up as `was_new=false`
+/// on the shadow's idempotent re-run.
 #[derive(Debug, Clone, Copy)]
 enum HandleStatus {
-    /// Log was for our leader and was fully persisted (or was an idempotent
-    /// no-op like a re-delivered close).
-    Ingested,
+    /// Log was for our leader and the underlying record_open / record_close
+    /// returned `was_new` as indicated. `was_new=true` means this call
+    /// performed the actual DB insert/update; `was_new=false` means the
+    /// state was already there (replay / cross-path duplicate).
+    Ingested { was_new: bool },
     /// Log was not for our leader, had an unexpected topic, failed to decode,
     /// or was a CLOSE for a signal we never opened — none of which a retry
     /// will fix, so the cursor can move past it.
@@ -109,6 +139,26 @@ pub async fn watch_leader(
     } else {
         info!("no prior leader signals — watcher will start from live head only");
     }
+
+    // Spawn the shadow poller. It runs independently of the WS session and
+    // is the system's only durable defence against the WS subscription
+    // silently dropping events while the underlying socket stays "up". The
+    // shadow re-fetches recent blocks via `eth_getLogs` on a tight cadence
+    // and re-runs them through the same idempotent `handle_log` path the
+    // WS subscription uses — anything the WS dropped is caught and
+    // replayed within `SHADOW_POLL_INTERVAL` (~30s) instead of waiting
+    // for the next session restart. The number of new ingests per tick
+    // is also the runtime metric for how leaky the WS path is.
+    {
+        let ws_url = ws_url.to_string();
+        let pool = pool.clone();
+        let tx = tx.clone();
+        let notifier = notifier.clone();
+        tokio::spawn(async move {
+            shadow_poller(ws_url, leader, trader_id, pool, tx, notifier).await;
+        });
+    }
+
     loop {
         let result = run_session(
             ws_url,
@@ -346,6 +396,211 @@ async fn run_session(
     }
 }
 
+/// Background task: every `SHADOW_POLL_INTERVAL`, re-fetch the most recent
+/// `SHADOW_POLL_LOOKBACK_BLOCKS` of callback-contract logs and run them
+/// through the same idempotent `handle_log` path the WS subscription
+/// uses. The shadow's *own* `was_new=true` ingests are, by definition,
+/// events the WS subscription failed to deliver — that count is the
+/// definitive "dropped events" signal we previously had no way to
+/// measure. The shadow also self-heals: anything it catches is
+/// already-replayed through `handle_log` by the time the alert fires,
+/// so copy-state and the executor are catching up in the background.
+///
+/// Failures inside the inner session (RPC error, decode error, etc.)
+/// kick out to the outer retry loop with exponential backoff. The
+/// shadow is never expected to exit; if `shadow_session` returns Ok
+/// that's a bug.
+async fn shadow_poller(
+    ws_url: String,
+    leader: Address,
+    trader_id: i32,
+    pool: DbPool,
+    tx: mpsc::Sender<TradeIntent>,
+    notifier: DiscordNotifier,
+) {
+    let mut backoff = Duration::from_secs(5);
+    loop {
+        match shadow_session(&ws_url, leader, trader_id, &pool, &tx, &notifier).await {
+            Ok(()) => {
+                warn!("shadow poller session ended unexpectedly without error; restarting");
+            }
+            Err(e) => {
+                warn!(error = ?e, backoff_secs = backoff.as_secs(), "shadow poller errored; restarting after backoff");
+            }
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(120));
+    }
+}
+
+async fn shadow_session(
+    ws_url: &str,
+    leader: Address,
+    trader_id: i32,
+    pool: &DbPool,
+    tx: &mpsc::Sender<TradeIntent>,
+    notifier: &DiscordNotifier,
+) -> Result<()> {
+    // We mirror `run_session`'s setup intentionally: the shadow must NOT
+    // share a provider with the main watcher session, because the same
+    // alloy WS transport that goes silent under the WS subscription would
+    // also silently break a shared provider's `get_logs` call. A second
+    // independent connection means a transport-level failure can affect
+    // at most one path at a time.
+    let provider = ProviderBuilder::new()
+        .connect_ws(WsConnect::new(ws_url.to_string()))
+        .await?;
+
+    let trading_storage = ITradingStorage::new(parse_addr(TRADING_STORAGE), &provider);
+    let callbacks_addr = trading_storage.callbacks().call().await?;
+
+    // Pair-name resolution is best-effort; failure here only degrades the
+    // human-readable symbol on log lines, not the ingest correctness.
+    let pairs = load_pair_names(&provider, parse_addr(PAIR_STORAGE), parse_addr(MULTICALL3))
+        .await
+        .unwrap_or_else(|e| {
+            warn!(error = ?e, "shadow poller failed to load pair names; symbols will fall back to indices");
+            HashMap::new()
+        });
+
+    info!(%callbacks_addr, "shadow poller subscribed view ready");
+
+    let base_filter = Filter::new().address(callbacks_addr).event_signature(vec![
+        <MarketExecuted as SolEvent>::SIGNATURE_HASH,
+        <LimitExecuted as SolEvent>::SIGNATURE_HASH,
+    ]);
+
+    // Seed the cursor relative to the current head, NOT to
+    // `signals::max_seen_block`. The WS session is already responsible
+    // for backfilling from the last persisted block on startup; the
+    // shadow only needs to cover NEW drops going forward. Seeding from
+    // the head minus the lookback window keeps the first tick small.
+    let head_at_start = provider.get_block_number().await?;
+    let mut cursor = head_at_start.saturating_sub(SHADOW_POLL_LOOKBACK_BLOCKS);
+    info!(
+        start_cursor = cursor,
+        head = head_at_start,
+        lookback = SHADOW_POLL_LOOKBACK_BLOCKS,
+        interval_secs = SHADOW_POLL_INTERVAL.as_secs(),
+        "shadow poller running"
+    );
+
+    let mut tick = tokio::time::interval(SHADOW_POLL_INTERVAL);
+    // Consume the first (immediate) tick so we don't double-fire alongside
+    // whatever the WS path is doing during startup.
+    tick.tick().await;
+
+    // Cooldown floor for the Discord notifier only — local logs always fire.
+    let mut last_notified: Option<Instant> = None;
+
+    loop {
+        tick.tick().await;
+
+        let head = match provider.get_block_number().await {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(error = ?e, "shadow poller get_block_number failed; will retry next tick");
+                continue;
+            }
+        };
+        if head < cursor {
+            // Reorg or RPC oddity. Don't rewind further than our lookback
+            // window — just wait for head to catch up.
+            continue;
+        }
+
+        // Always look back a fixed window past the last cursor so a log
+        // that landed right before our previous head-read can't slip
+        // through. `handle_log` deduplicates against the DB, so overlap
+        // is free apart from a few cache-warm reads.
+        let from = cursor.saturating_sub(SHADOW_POLL_LOOKBACK_BLOCKS);
+        let to = head;
+        let filter = base_filter.clone().from_block(from).to_block(to);
+        let logs = match provider.get_logs(&filter).await {
+            Ok(l) => l,
+            Err(e) => {
+                warn!(error = ?e, from, to, "shadow poller get_logs failed; will retry next tick");
+                continue;
+            }
+        };
+
+        let mut dropped: u32 = 0;
+        let mut samples: Vec<String> = Vec::new();
+        // Per-tick cursor lock: if ANY log in this batch produced a
+        // `HandleStatus::Failed`, we must NOT advance `cursor` past the
+        // batch — the next tick's lookback window has to re-cover the
+        // failed range so the durability guarantee holds. Without this,
+        // a transient DB blip or a closed intent channel would let the
+        // shadow silently drop the very events it exists to recover,
+        // turning Layer 2 into a no-op exactly when it's needed.
+        // Matches the `cursor_locked` discipline in `run_session`.
+        let mut had_failure = false;
+        for log in &logs {
+            let status = handle_log(log, leader, trader_id, pool, &pairs, tx, notifier).await;
+            match status {
+                HandleStatus::Ingested { was_new: true } => {
+                    dropped += 1;
+                    if samples.len() < 5
+                        && let Some(h) = log.transaction_hash
+                    {
+                        samples.push(format!("{h:#x}"));
+                    }
+                }
+                HandleStatus::Failed => {
+                    // Keep processing the rest of the batch: handle_log is
+                    // idempotent, so later logs that succeed here just get
+                    // re-ingested as no-ops on the next tick. The cursor
+                    // freeze (below) is what preserves correctness.
+                    had_failure = true;
+                }
+                HandleStatus::Ingested { was_new: false } | HandleStatus::Irrelevant => {}
+            }
+        }
+
+        if dropped > 0 {
+            warn!(
+                count = dropped,
+                from_block = from,
+                to_block = to,
+                ?samples,
+                "shadow poller ingested events the WS subscription dropped"
+            );
+            let should_notify = match last_notified {
+                None => true,
+                Some(t) => t.elapsed() >= DROPPED_EVENTS_NOTIFY_COOLDOWN,
+            };
+            if should_notify && notifier.enabled() {
+                notifier.notify_dropped_events(DroppedEvents {
+                    count: dropped,
+                    from_block: from,
+                    to_block: to,
+                    samples: samples.clone(),
+                });
+                last_notified = Some(Instant::now());
+            }
+        }
+
+        if had_failure {
+            // Cursor stays put. Next tick re-fetches `cursor - LOOKBACK`
+            // to the new head, which will include the failed range so
+            // long as the failure resolves before the failed blocks
+            // drop out of the lookback window (~5 min of chain time).
+            // A sustained failure that outlasts the lookback window is
+            // a real outage — the surrounding logs (DB error / intent
+            // channel closed errors from `handle_log`) are the alert
+            // surface for that.
+            warn!(
+                from_block = from,
+                to_block = to,
+                cursor,
+                "shadow poller saw handle_log Failed in this batch; holding cursor for next-tick retry"
+            );
+        } else {
+            cursor = head;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_log(
     log: &alloy::rpc::types::Log,
@@ -403,7 +658,7 @@ async fn handle_log(
                     if !was_new {
                         match replay_should_re_emit(pool, signal_id, &symbol, &tx_hash, notifier).await {
                             Ok(true) => {}
-                            Ok(false) => return HandleStatus::Ingested,
+                            Ok(false) => return HandleStatus::Ingested { was_new: false },
                             Err(e) => {
                                 error!(error = ?e, signal_id, %tx_hash, "failed to query trade existence for replay decision; cursor will not advance past this log");
                                 return HandleStatus::Failed;
@@ -454,6 +709,12 @@ async fn handle_log(
                     source_tx: tx_hash.clone(),
                     signal_id,
                 },
+                // `Ok(None)` means either re-delivery of an already-closed
+                // signal (idempotent no-op) or a close for a signal we
+                // never opened. Both are "nothing to do here"; we report
+                // Irrelevant rather than Ingested so the shadow poller
+                // doesn't count this as a recovered drop. The unmatched
+                // case has already been paged inside `record_close`.
                 Ok(None) => return HandleStatus::Irrelevant,
                 Err(e) => {
                     error!(error = ?e, %tx_hash, "failed to record CLOSE to DB; cursor will not advance past this log");
@@ -465,7 +726,11 @@ async fn handle_log(
             error!(error = ?e, "intent channel closed; executor must have crashed");
             return HandleStatus::Failed;
         }
-        HandleStatus::Ingested
+        // Reaching here means either record_open returned was_new=true
+        // (new OPEN intent built+sent) or record_close returned Some
+        // (new CLOSE intent built+sent). Either way the DB state changed
+        // as a direct result of this call → was_new=true.
+        HandleStatus::Ingested { was_new: true }
     } else if topic0 == <LimitExecuted as SolEvent>::SIGNATURE_HASH {
         let decoded = match <LimitExecuted as SolEvent>::decode_log(&log.inner) {
             Ok(d) => d,
@@ -558,7 +823,7 @@ async fn handle_log(
                     if !was_new {
                         match replay_should_re_emit(pool, signal_id, &symbol, &tx_hash, notifier).await {
                             Ok(true) => {}
-                            Ok(false) => return HandleStatus::Ingested,
+                            Ok(false) => return HandleStatus::Ingested { was_new: false },
                             Err(e) => {
                                 error!(error = ?e, signal_id, %tx_hash, "failed to query trade existence for replay decision; cursor will not advance past this log");
                                 return HandleStatus::Failed;
@@ -588,7 +853,10 @@ async fn handle_log(
             error!(error = ?e, "intent channel closed; executor must have crashed");
             return HandleStatus::Failed;
         }
-        HandleStatus::Ingested
+        // See the corresponding comment on the MarketExecuted branch: this
+        // return is only reached when DB state changed as a result of this
+        // call, so was_new=true.
+        HandleStatus::Ingested { was_new: true }
     } else {
         debug!(%topic0, %tx_hash, "log with unexpected topic0");
         HandleStatus::Irrelevant
