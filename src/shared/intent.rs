@@ -31,6 +31,8 @@ impl fmt::Display for Side {
 pub enum TradeIntent {
     Open {
         leader: Address,
+        leader_name: String,
+        copy_ratio: f64,
         symbol: String,
         side: Side,
         leader_collateral_usd: f64,
@@ -43,6 +45,8 @@ pub enum TradeIntent {
     },
     Close {
         leader: Address,
+        leader_name: String,
+        copy_ratio: f64,
         symbol: String,
         leader_pair_index: u64,
         leader_position_index: u64,

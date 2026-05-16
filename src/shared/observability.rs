@@ -34,20 +34,20 @@ impl LogGuard {
 }
 
 pub fn init() -> Result<LogGuard> {
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let fmt_layer = tracing_subscriber::fmt::layer();
 
     let token_set = std::env::var("AXIOM_TOKEN").is_ok();
-    let dataset = std::env::var("AXIOM_DATASET").ok().filter(|s| !s.is_empty());
+    let dataset = std::env::var("AXIOM_DATASET")
+        .ok()
+        .filter(|s| !s.is_empty());
 
     let (axiom_layer, guard_inner) = match (token_set, dataset) {
         (true, Some(dataset)) => match Client::new() {
             Ok(client) => {
                 let (tx, rx) = mpsc::channel::<Value>(CHANNEL_CAP);
                 let shutdown = Arc::new(Notify::new());
-                let handle =
-                    tokio::spawn(run_ingest(rx, client, dataset, shutdown.clone()));
+                let handle = tokio::spawn(run_ingest(rx, client, dataset, shutdown.clone()));
                 (
                     Some(AxiomLayer { tx }),
                     Some(GuardInner { shutdown, handle }),
@@ -70,9 +70,7 @@ pub fn init() -> Result<LogGuard> {
     if guard_inner.is_some() {
         tracing::info!(service = SERVICE_NAME, "Axiom log shipping enabled");
     } else {
-        tracing::warn!(
-            "Axiom log shipping disabled (set AXIOM_TOKEN and AXIOM_DATASET to enable)"
-        );
+        tracing::warn!("Axiom log shipping disabled (set AXIOM_TOKEN and AXIOM_DATASET to enable)");
     }
 
     Ok(LogGuard { inner: guard_inner })

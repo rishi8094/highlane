@@ -1,0 +1,37 @@
+/// Highlane copy-trading config.
+module config
+
+class Leader {
+  /// Display name used in logs and Discord embeds.
+  name: String
+
+  /// On-chain wallet to follow. Lowercased / checksummed both work; the
+  /// loader normalizes to lower-hex before DB upsert.
+  wallet: String
+
+  /// Source DEX the watcher subscribes to. Today only "avantis" is wired.
+  source_dex: "avantis"
+
+  /// Fraction of the leader's collateral the follower copies (per-trade).
+  /// e.g. 0.35 = 35%. Range enforced server-side: (0, 5].
+  copy_ratio: Float
+
+  /// Symbols this leader is allowed to trade (e.g. "BTC", "ETH"). Opens
+  /// outside this list are skipped; closes for previously recorded opens
+  /// are still processed so we never strand a follower position. Each
+  /// symbol may belong to a single leader only — overlap fails boot.
+  allowed_tokens: List<String>
+}
+
+// Pkl distinguishes `List<T>` (immutable, takes literal args like `List(a, b)`)
+// from `Listing<T>` (amendable, takes a `new {…}` block). We use `Listing` so
+// adding a leader is just another `new Leader { … }` entry below.
+leaders: Listing<Leader> = new {
+  new Leader {
+    name = "highlane"
+    wallet = "0x3b514bCDd2E96af48374c3D2ca42736a2393212F"
+    source_dex = "avantis"
+    copy_ratio = 0.5
+    allowed_tokens = List("BTC", "ETH", "LIT")
+  }
+}

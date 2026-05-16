@@ -96,7 +96,10 @@ async fn main() -> Result<()> {
         args.out_dir.display()
     );
 
-    let http = Http::builder().timeout(HTTP_TIMEOUT).user_agent(UA).build()?;
+    let http = Http::builder()
+        .timeout(HTTP_TIMEOUT)
+        .user_agent(UA)
+        .build()?;
 
     let mut handles = Vec::new();
     for v in &args.venues {
@@ -150,13 +153,13 @@ fn parse_args() -> Result<Args> {
             (arg.as_str(), None)
         };
         let key = key.to_string();
-        let take_val = |k: &str, inline: Option<String>, it: &mut std::iter::Peekable<_>| -> Result<String> {
-            if let Some(v) = inline {
-                return Ok(v);
-            }
-            it.next()
-                .ok_or_else(|| eyre!("flag {k} requires a value"))
-        };
+        let take_val =
+            |k: &str, inline: Option<String>, it: &mut std::iter::Peekable<_>| -> Result<String> {
+                if let Some(v) = inline {
+                    return Ok(v);
+                }
+                it.next().ok_or_else(|| eyre!("flag {k} requires a value"))
+            };
         match key.as_str() {
             "--venues" => {
                 let v = take_val(&key, val_inline, &mut iter)?;
@@ -173,12 +176,8 @@ fn parse_args() -> Result<Args> {
             }
             "--from" => from = Some(take_val(&key, val_inline, &mut iter)?),
             "--to" => to = Some(take_val(&key, val_inline, &mut iter)?),
-            "--resolution" | "--res" => {
-                resolution = Some(take_val(&key, val_inline, &mut iter)?)
-            }
-            "--out-dir" => {
-                out_dir = Some(PathBuf::from(take_val(&key, val_inline, &mut iter)?))
-            }
+            "--resolution" | "--res" => resolution = Some(take_val(&key, val_inline, &mut iter)?),
+            "--out-dir" => out_dir = Some(PathBuf::from(take_val(&key, val_inline, &mut iter)?)),
             "--force" => force = true,
             "-h" | "--help" => {
                 print_help();
@@ -200,7 +199,9 @@ fn parse_args() -> Result<Args> {
         None => to_unix - 24 * 3600,
     };
     if from_unix >= to_unix {
-        return Err(eyre!("--from must be < --to (got from={from_unix} to={to_unix})"));
+        return Err(eyre!(
+            "--from must be < --to (got from={from_unix} to={to_unix})"
+        ));
     }
 
     Ok(Args {
@@ -300,7 +301,7 @@ fn lighter_market_id(sym: &str) -> Result<i32> {
 }
 fn lighter_resolution(args: &Args) -> String {
     let m = args.resolution_minutes;
-    if m % 60 == 0 {
+    if m.is_multiple_of(60) {
         format!("{}h", m / 60)
     } else {
         format!("{m}m")
@@ -390,7 +391,7 @@ async fn fetch_avantis(http: &Http, sym: &str, args: &Args) -> Result<String> {
 // ───────────── Hyperliquid ─────────────────────────────────────────────────
 fn hl_resolution(args: &Args) -> String {
     let m = args.resolution_minutes;
-    if m % 60 == 0 {
+    if m.is_multiple_of(60) {
         format!("{}h", m / 60)
     } else {
         format!("{m}m")
@@ -436,7 +437,10 @@ async fn fetch_hyperliquid(http: &Http, sym: &str, args: &Args) -> Result<String
             ));
         }
         let candles: Vec<Value> = serde_json::from_str(&raw).with_context(|| {
-            format!("decode hl page {page}; head: {}", &raw[..raw.len().min(200)])
+            format!(
+                "decode hl page {page}; head: {}",
+                &raw[..raw.len().min(200)]
+            )
         })?;
         if candles.is_empty() {
             break;
@@ -569,7 +573,10 @@ async fn fetch_aster(http: &Http, sym: &str, args: &Args) -> Result<String> {
             ));
         }
         let rows: Vec<Value> = serde_json::from_str(&raw).with_context(|| {
-            format!("decode aster page {page}; head: {}", &raw[..raw.len().min(200)])
+            format!(
+                "decode aster page {page}; head: {}",
+                &raw[..raw.len().min(200)]
+            )
         })?;
         if rows.is_empty() {
             break;

@@ -12,8 +12,8 @@ use crate::db::{DbPool, trades};
 use crate::shared::dex::Dex;
 use crate::shared::intent::{Side, TradeIntent};
 use crate::shared::notify::{
-    CloseFill, DiscordNotifier, OpenFill, OrphanAlert, OrphanKind, StartupInfo, UnknownClose,
-    UtilisationAlert, UtilisationSeverity,
+    CloseFill, DiscordNotifier, LeaderSummary, OpenFill, OrphanAlert, OrphanKind, StartupInfo,
+    UnknownClose, UtilisationAlert, UtilisationSeverity,
 };
 
 const TARGET_DEX: Dex = Dex::Lighter;
@@ -45,12 +45,6 @@ pub struct LighterConfig {
     pub account_index_override: Option<i64>,
     pub api_key_index: i32,
     pub api_key_private_hex: String,
-    /// If `Some`, override the live Lighter wallet balance with this value.
-    /// If `None`, the executor reads `collateral` from /api/v1/account at
-    /// startup and uses that as the budget.
-    pub follower_budget_override: Option<f64>,
-    pub leader_max_exposure_usd: f64,
-    pub dry_run: bool,
     pub slippage_bps: u32,
 }
 
@@ -61,7 +55,7 @@ pub async fn run(
     cfg: LighterConfig,
     pool: DbPool,
     notifier: DiscordNotifier,
-    leader_address: String,
+    leaders_summary: Vec<LeaderSummary>,
 ) -> Result<()> {
     let client = LighterClient::new(&cfg.base_url)?;
 
@@ -96,56 +90,43 @@ pub async fn run(
         }
     };
 
-    let follower_budget_usd = match cfg.follower_budget_override {
-        Some(v) => {
-            info!(budget = v, "FOLLOWER_BUDGET_USD override active");
-            v
-        }
-        None => {
-            let det = client.account(account_index).await?;
-            let bal = det.wallet_balance().ok_or_else(|| {
-                eyre::eyre!(
-                    "Lighter /account did not return collateral or available_balance; set FOLLOWER_BUDGET_USD to override"
-                )
-            })?;
-            if bal <= 0.0 {
-                return Err(eyre::eyre!(
-                    "Lighter account_index={account_index} reports {bal} collateral. Either the account is empty, you are pointing at the wrong sub-account (check LIGHTER_ACCOUNT_INDEX), or set FOLLOWER_BUDGET_USD to override."
-                ));
-            }
-            info!(
-                account_index,
-                budget = bal,
-                "using live Lighter wallet balance as budget"
-            );
-            bal
+    // Read the live wallet balance for the startup embed + utilization
+    // baselining. With copy_ratio-driven sizing this is no longer required,
+    // so failure to read is a warning, not fatal.
+    let follower_balance_usd: Option<f64> = match client.account(account_index).await {
+        Ok(det) => det.wallet_balance().filter(|b| *b > 0.0),
+        Err(e) => {
+            warn!(error = ?e, "could not read Lighter account balance at startup; continuing");
+            None
         }
     };
+    if let Some(bal) = follower_balance_usd {
+        info!(account_index, balance_usd = bal, "Lighter wallet balance");
+    } else {
+        warn!(
+            account_index,
+            "Lighter balance unavailable or zero at startup; utilization alerts will still poll live"
+        );
+    }
 
     let markets = load_markets(&client).await?;
     info!(market_count = markets.len(), "Lighter markets ready");
 
-    let signer = if cfg.dry_run {
-        None
-    } else {
-        let path = LighterSigner::default_library_path()
-            .ok_or_else(|| eyre::eyre!("unsupported platform for Lighter signer"))?;
-        Some(LighterSigner::load(
-            &path,
-            &cfg.base_url,
-            cfg.chain_id,
-            &cfg.api_key_private_hex,
-            cfg.api_key_index,
-            account_index,
-        )?)
-    };
+    let signer_path = LighterSigner::default_library_path()
+        .ok_or_else(|| eyre::eyre!("unsupported platform for Lighter signer"))?;
+    let signer = LighterSigner::load(
+        &signer_path,
+        &cfg.base_url,
+        cfg.chain_id,
+        &cfg.api_key_private_hex,
+        cfg.api_key_index,
+        account_index,
+    )?;
 
     let open_trades = trades::list_open_for_target(&pool, TARGET_DEX).await?;
     info!(
         positions = open_trades.len(),
-        dry_run = cfg.dry_run,
-        budget_usd = follower_budget_usd,
-        leader_max_exposure_usd = cfg.leader_max_exposure_usd,
+        leader_count = leaders_summary.len(),
         "executor ready"
     );
 
@@ -164,30 +145,39 @@ pub async fn run(
 
     if notifier.enabled() {
         notifier.notify_startup(StartupInfo {
-            leader_address: leader_address.clone(),
             follower_l1_address: cfg.l1_address.clone(),
             account_index,
-            budget_usd: follower_budget_usd,
-            leader_max_exposure_usd: cfg.leader_max_exposure_usd,
+            follower_balance_usd,
             slippage_bps: cfg.slippage_bps,
-            dry_run: cfg.dry_run,
+            leaders: leaders_summary.clone(),
         });
     }
 
-    if !cfg.dry_run && notifier.enabled() {
+    if notifier.enabled() {
         spawn_utilisation_poller(client.clone(), account_index, notifier.clone());
     }
+
+    // Per-leader open notional snapshot. Runs alongside the utilization
+    // poller and emits one info line per leader so Axiom can attribute
+    // account utilization back to a specific follower-side strategy. Same
+    // cadence as the utilization poll to keep the load profile predictable.
+    spawn_per_leader_snapshot(
+        pool.clone(),
+        client.clone(),
+        markets.clone(),
+        account_index,
+        leaders_summary.clone(),
+    );
 
     while let Some(intent) = rx.recv().await {
         if let Err(e) = handle_intent(
             &intent,
             &cfg,
             &client,
-            signer.as_ref(),
+            &signer,
             &markets,
             &pool,
             account_index,
-            follower_budget_usd,
             &notifier,
         )
         .await
@@ -196,6 +186,113 @@ pub async fn run(
         }
     }
     warn!("intent channel closed; executor stopping");
+    Ok(())
+}
+
+fn spawn_per_leader_snapshot(
+    pool: DbPool,
+    client: LighterClient,
+    markets: HashMap<String, Market>,
+    account_index: i64,
+    leaders: Vec<LeaderSummary>,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(UTIL_POLL_INTERVAL);
+        // Skip the immediate-fire so we don't compete with startup logging.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            if let Err(e) =
+                log_per_leader_snapshot(&pool, &client, &markets, account_index, &leaders).await
+            {
+                warn!(target: "snapshot", error = ?e, "per-leader notional snapshot failed");
+            }
+        }
+    });
+}
+
+async fn log_per_leader_snapshot(
+    pool: &DbPool,
+    client: &LighterClient,
+    markets: &HashMap<String, Market>,
+    account_index: i64,
+    leaders: &[LeaderSummary],
+) -> Result<()> {
+    let rows = trades::list_open_with_trader_for_target(pool, TARGET_DEX).await?;
+    let mut by_trader: HashMap<i32, f64> = HashMap::new();
+    for r in rows {
+        let size_decimals = markets
+            .values()
+            .find(|m| m.market_id == r.market_id)
+            .map(|m| m.size_decimals)
+            .unwrap_or(0);
+        let size_human = r.size as f64 / 10f64.powi(size_decimals);
+        let price = r.entry_price.unwrap_or(0.0);
+        *by_trader.entry(r.trader_id).or_default() += size_human * price;
+    }
+
+    let utilisation_pct = match client.account(account_index).await {
+        Ok(det) => {
+            let c = det
+                .collateral
+                .as_deref()
+                .and_then(|s| s.parse::<f64>().ok());
+            let a = det
+                .available_balance
+                .as_deref()
+                .and_then(|s| s.parse::<f64>().ok());
+            match (c, a) {
+                (Some(c), Some(a)) if c > 0.0 => Some(((c - a).max(0.0)) / c),
+                _ => None,
+            }
+        }
+        Err(e) => {
+            debug!(target: "snapshot", error = ?e, "could not read account for utilization");
+            None
+        }
+    };
+
+    // Emit one line per *configured* leader, even with zero open notional,
+    // so the observability story is "I can see every leader's state at a
+    // glance" rather than "I can see leaders that currently happen to have
+    // open trades." Idle leaders are exactly what an operator wants to
+    // confirm during a quiet stretch on Avantis. Anything left in
+    // `by_trader` after this loop belongs to a trader_id absent from the
+    // current config (e.g. a leader was removed from config.pkl while
+    // positions remain on Lighter) — surface that loudly so it can't hide.
+    let mut configured_total: f64 = 0.0;
+    for l in leaders {
+        let notional = by_trader.remove(&l.trader_id).unwrap_or(0.0);
+        configured_total += notional;
+        info!(
+            target: "snapshot",
+            leader = %l.name,
+            trader_id = l.trader_id,
+            copy_ratio = l.copy_ratio,
+            open_notional_usd = notional,
+            "per-leader open notional"
+        );
+    }
+    let mut unconfigured_total: f64 = 0.0;
+    for (trader_id, notional) in &by_trader {
+        unconfigured_total += notional;
+        warn!(
+            target: "snapshot",
+            trader_id,
+            open_notional_usd = notional,
+            "open notional from a trader_id not in current config.pkl — leader was removed but Lighter still holds exposure"
+        );
+    }
+    info!(
+        target: "snapshot",
+        configured_leaders = leaders.len(),
+        unconfigured_leaders = by_trader.len(),
+        configured_open_notional_usd = configured_total,
+        unconfigured_open_notional_usd = unconfigured_total,
+        total_open_notional_usd = configured_total + unconfigured_total,
+        utilisation_pct = utilisation_pct,
+        "shared-account snapshot"
+    );
     Ok(())
 }
 
@@ -229,16 +326,17 @@ async fn handle_intent(
     intent: &TradeIntent,
     cfg: &LighterConfig,
     client: &LighterClient,
-    signer: Option<&LighterSigner>,
+    signer: &LighterSigner,
     markets: &HashMap<String, Market>,
     pool: &DbPool,
     account_index: i64,
-    follower_budget_usd: f64,
     notifier: &DiscordNotifier,
 ) -> Result<()> {
     match intent {
         TradeIntent::Open {
             leader: _,
+            leader_name,
+            copy_ratio,
             symbol,
             side,
             leader_collateral_usd,
@@ -251,7 +349,7 @@ async fn handle_intent(
         } => {
             let root = symbol_root(symbol);
             let Some(market) = markets.get(&root) else {
-                warn!(symbol = %symbol, root = %root, "symbol not on Lighter — skipping leader OPEN");
+                warn!(leader = %leader_name, symbol = %symbol, root = %root, "symbol not on Lighter — skipping leader OPEN");
                 return Ok(());
             };
 
@@ -259,8 +357,7 @@ async fn handle_intent(
                 *leader_collateral_usd,
                 *leader_leverage,
                 *leader_exec_price,
-                follower_budget_usd,
-                cfg.leader_max_exposure_usd,
+                *copy_ratio,
                 market,
             ) {
                 Sizing::Ok(s) => s,
@@ -269,7 +366,7 @@ async fn handle_intent(
                     min_notional,
                 } => {
                     warn!(
-                        symbol = %symbol, target_notional, min_notional,
+                        leader = %leader_name, symbol = %symbol, target_notional, min_notional,
                         "leader OPEN sized below 50%% of Lighter min — skipping"
                     );
                     return Ok(());
@@ -289,6 +386,8 @@ async fn handle_intent(
 
             info!(
                 target: "execute",
+                leader = %leader_name,
+                copy_ratio = *copy_ratio,
                 symbol = %symbol, side = %side, %market.market_id,
                 size = sized.base_amount_int,
                 price = price_int,
@@ -299,9 +398,7 @@ async fn handle_intent(
                 "sending Lighter market IOC OPEN"
             );
 
-            let mut our_tx_hash: Option<String> = None;
-
-            let actual_filled = if let Some(signer) = signer {
+            let (actual_filled, our_tx_hash) = {
                 let (pre_size, nonce) = tokio::try_join!(
                     current_signed_size(client, account_index, market),
                     client.next_nonce(account_index, cfg.api_key_index),
@@ -333,7 +430,7 @@ async fn handle_intent(
                     tx_hash = %resp.tx_hash, code = resp.code,
                     "Lighter accepted OPEN"
                 );
-                our_tx_hash = Some(resp.tx_hash);
+                let our_tx_hash: Option<String> = Some(resp.tx_hash);
 
                 let post_size =
                     poll_post_size_after_fill(client, account_index, market, pre_size).await?;
@@ -367,10 +464,7 @@ async fn handle_intent(
                         "partial fill on Lighter OPEN — recording actual filled amount"
                     );
                 }
-                actual
-            } else {
-                info!(target: "execute", dry_run = true, "[DRY] would send OPEN");
-                sized.base_amount_int
+                (actual, our_tx_hash)
             };
 
             trades::record_open(
@@ -389,7 +483,7 @@ async fn handle_intent(
             )
             .await?;
 
-            if !cfg.dry_run && notifier.enabled() {
+            if notifier.enabled() {
                 let size_human = actual_filled as f64 / 10f64.powi(market.size_decimals);
                 // Lighter doesn't return a per-fill VWAP; the IOC's slippage
                 // bound is the worst price we could have accepted, so use it
@@ -414,6 +508,8 @@ async fn handle_intent(
 
         TradeIntent::Close {
             leader: _,
+            leader_name,
+            copy_ratio: _,
             symbol,
             leader_pair_index,
             leader_position_index,
@@ -425,6 +521,7 @@ async fn handle_intent(
         } => {
             let Some(open) = trades::find_open_for_signal(pool, *signal_id).await? else {
                 warn!(
+                    leader = %leader_name,
                     %symbol, leader_pair_index, leader_position_index, signal_id, %source_tx,
                     "leader CLOSE for unknown trade (likely opened before we started or different DEX) — skipping"
                 );
@@ -489,8 +586,7 @@ async fn handle_intent(
             //   next leader CLOSE / startup reconciliation can catch it.
             //   Without this, a non-crossing IOC silently orphans the
             //   position on Lighter (signal_id ≈ 1100, BTC/USD 2026-05-05).
-            let (close_tx_hash, actual_closed): (Option<String>, i64) = if let Some(signer) = signer
-            {
+            let (close_tx_hash, actual_closed): (Option<String>, i64) = {
                 let (pre_size, nonce) = tokio::try_join!(
                     current_signed_size(client, account_index, market),
                     client.next_nonce(account_index, cfg.api_key_index),
@@ -528,9 +624,6 @@ async fn handle_intent(
                     .saturating_sub(post_size.unsigned_abs() as i64)
                     .max(0);
                 (Some(resp.tx_hash), closed)
-            } else {
-                info!(target: "execute", dry_run = true, "[DRY] would send CLOSE");
-                (None, open.size)
             };
 
             if actual_closed == 0 {
@@ -599,7 +692,7 @@ async fn handle_intent(
             )
             .await?;
 
-            if !cfg.dry_run && notifier.enabled() {
+            if notifier.enabled() {
                 let size_human = open.size as f64 / 10f64.powi(market.size_decimals);
                 // Close fill price isn't returned by Lighter either; the IOC
                 // bound is again our worst-case reference.
@@ -940,12 +1033,10 @@ pub fn size_for_open(
     leader_collateral_usd: f64,
     leader_leverage: u64,
     leader_exec_price: f64,
-    follower_budget_usd: f64,
-    leader_max_exposure_usd: f64,
+    copy_ratio: f64,
     market: &Market,
 ) -> Sizing {
-    let ratio = follower_budget_usd / leader_max_exposure_usd;
-    let target_collateral = leader_collateral_usd * ratio;
+    let target_collateral = leader_collateral_usd * copy_ratio;
     let target_leverage = leader_leverage.min(market.max_leverage);
     let target_notional = target_collateral * target_leverage as f64;
     if leader_exec_price <= 0.0 {
@@ -995,12 +1086,18 @@ mod tests {
         }
     }
 
+    // Pre-migration the bot computed sizing from
+    //   ratio = follower_budget_usd / leader_max_exposure_usd
+    // (defaults $1k / $125k = 0.008). copy_ratio is now passed directly;
+    // these regressions keep the same numerical baseline so a parity run
+    // produces identical sizes.
+    const PARITY_RATIO: f64 = 1_000.0 / 125_000.0; // 0.008
+
     #[test]
     fn scaling_25k_at_100x_caps_to_lighter_max() {
         // Leader: $25k collateral at 100x → $2.5M notional on Avantis
-        // Follower budget $1k, leader cap $125k → ratio = 0.008
-        // Expected follower: $200 collateral, capped to 25x → $5,000 notional
-        let s = match size_for_open(25_000.0, 100, 77_000.0, 1_000.0, 125_000.0, &btc_market()) {
+        // copy_ratio = 0.008 → $200 follower collateral, capped to 25x → $5,000 notional
+        let s = match size_for_open(25_000.0, 100, 77_000.0, PARITY_RATIO, &btc_market()) {
             Sizing::Ok(s) => s,
             Sizing::SkipBelowMin { .. } => panic!("should size, not skip"),
         };
@@ -1015,7 +1112,7 @@ mod tests {
 
     #[test]
     fn tiny_leader_trade_below_min_skips() {
-        // Leader: $10 collateral at 5x → $50 notional. Follower ratio 0.008 → $0.40 target.
+        // Leader: $10 collateral at 5x → $50 notional. copy_ratio 0.008 → $0.40 target.
         let market = Market {
             market_id: 1,
             symbol: "BTC".into(),
@@ -1024,7 +1121,7 @@ mod tests {
             min_base_amount: 0.001, // min $77 at $77k
             max_leverage: 25,
         };
-        match size_for_open(10.0, 5, 77_000.0, 1_000.0, 125_000.0, &market) {
+        match size_for_open(10.0, 5, 77_000.0, PARITY_RATIO, &market) {
             Sizing::SkipBelowMin { .. } => {} // expected
             Sizing::Ok(s) => panic!("should skip, but got base={}", s.base_amount_int),
         }
@@ -1042,7 +1139,7 @@ mod tests {
             max_leverage: 25,
         };
         // Want target ≈ $50 (≥ 50% of $77). Leader: $6,250 at 1x → $50 follower notional.
-        let s = match size_for_open(6_250.0, 1, 77_000.0, 1_000.0, 125_000.0, &market) {
+        let s = match size_for_open(6_250.0, 1, 77_000.0, PARITY_RATIO, &market) {
             Sizing::Ok(s) => s,
             Sizing::SkipBelowMin {
                 target_notional,
@@ -1053,5 +1150,20 @@ mod tests {
         };
         let base_decimal = (s.base_amount_int as f64) / 10f64.powi(4);
         assert!((base_decimal - 0.001).abs() < 1e-9, "got {base_decimal}");
+    }
+
+    #[test]
+    fn copy_ratio_scales_linearly() {
+        // Double the ratio → double the follower collateral (everything else equal).
+        let small = match size_for_open(10_000.0, 1, 77_000.0, 0.1, &btc_market()) {
+            Sizing::Ok(s) => s,
+            Sizing::SkipBelowMin { .. } => panic!("should size"),
+        };
+        let big = match size_for_open(10_000.0, 1, 77_000.0, 0.2, &btc_market()) {
+            Sizing::Ok(s) => s,
+            Sizing::SkipBelowMin { .. } => panic!("should size"),
+        };
+        assert!((small.target_collateral_usd - 1_000.0).abs() < 0.01);
+        assert!((big.target_collateral_usd - 2_000.0).abs() < 0.01);
     }
 }

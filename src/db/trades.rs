@@ -5,9 +5,21 @@ use eyre::Result;
 
 use crate::db::DbPool;
 use crate::db::models::{NewTrade, Trade};
-use crate::schema::trades;
+use crate::schema::{signals, trades};
 use crate::shared::dex::Dex;
 use crate::shared::intent::Side;
+
+/// One row of the per-leader open-position snapshot. Produced by
+/// [`list_open_with_trader_for_target`] and consumed by the executor's
+/// periodic notional logger so operators can see who is consuming the shared
+/// Lighter account.
+#[derive(Debug, Clone)]
+pub struct OpenTradePerLeader {
+    pub trader_id: i32,
+    pub market_id: i32,
+    pub size: i64,
+    pub entry_price: Option<f64>,
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn record_open(
@@ -134,6 +146,40 @@ pub async fn list_open_for_target(pool: &DbPool, target_dex: Dex) -> Result<Vec<
         .load(&mut conn)
         .await?;
     Ok(rows)
+}
+
+/// All open trades on `target_dex` joined to their `signals` row so the
+/// originating `trader_id` is exposed. Used by the executor's periodic
+/// per-leader notional snapshot — grouping is done in Rust on the returned
+/// rows so the SQL stays a simple join + filter.
+pub async fn list_open_with_trader_for_target(
+    pool: &DbPool,
+    target_dex: Dex,
+) -> Result<Vec<OpenTradePerLeader>> {
+    let mut conn = pool.get().await?;
+    let rows: Vec<(i32, i32, i64, Option<f64>)> = trades::table
+        .inner_join(signals::table.on(signals::id.eq(trades::signal_id)))
+        .filter(trades::exit_at.is_null())
+        .filter(trades::target_dex.eq(target_dex))
+        .select((
+            signals::trader_id,
+            trades::market_id,
+            trades::size,
+            trades::entry_price,
+        ))
+        .load(&mut conn)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(trader_id, market_id, size, entry_price)| OpenTradePerLeader {
+                trader_id,
+                market_id,
+                size,
+                entry_price,
+            },
+        )
+        .collect())
 }
 
 /// Bulk-close every open trade on `(target_dex, market_id)` by stamping

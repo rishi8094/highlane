@@ -130,14 +130,26 @@ pub enum OrphanKind {
 }
 
 #[derive(Debug, Clone)]
+pub struct LeaderSummary {
+    /// DB `traders.id`. Carried through so the executor's per-leader
+    /// notional snapshot can join its by-trader_id aggregation to a
+    /// human-readable name. Not rendered in Discord embeds.
+    pub trader_id: i32,
+    pub name: String,
+    pub wallet: String,
+    pub copy_ratio: f64,
+    pub allowed_tokens: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct StartupInfo {
-    pub leader_address: String,
     pub follower_l1_address: String,
     pub account_index: i64,
-    pub budget_usd: f64,
-    pub leader_max_exposure_usd: f64,
+    /// Live Lighter wallet balance at startup, if it could be read. Now
+    /// informational only — sizing is per-leader via copy_ratio.
+    pub follower_balance_usd: Option<f64>,
     pub slippage_bps: u32,
-    pub dry_run: bool,
+    pub leaders: Vec<LeaderSummary>,
 }
 
 #[derive(Clone)]
@@ -366,18 +378,37 @@ fn build_shutdown_embed(reason: &str, fatal: bool) -> Value {
 }
 
 fn build_startup_embed(info: &StartupInfo) -> Value {
-    let mode = if info.dry_run { "DRY-RUN" } else { "LIVE" };
-    let title = format!("highlane online · {mode}");
+    let title = "highlane online · LIVE".to_string();
+    let balance = match info.follower_balance_usd {
+        Some(b) => fmt_usd(b),
+        None => "—".to_string(),
+    };
+    let leaders_value = if info.leaders.is_empty() {
+        "—".to_string()
+    } else {
+        info.leaders
+            .iter()
+            .map(|l| {
+                format!(
+                    "• **{}** `{}` · {:.2}× · {}",
+                    l.name,
+                    truncate_addr(&l.wallet),
+                    l.copy_ratio,
+                    l.allowed_tokens.join(", "),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     let embed = json!({
         "title": title,
-        "color": if info.dry_run { COLOR_AMBER } else { COLOR_WIN },
+        "color": COLOR_WIN,
         "fields": [
-            { "name": "Leader", "value": format!("`{}`", truncate_addr(&info.leader_address)), "inline": true },
             { "name": "Follower", "value": format!("`{}`", truncate_addr(&info.follower_l1_address)), "inline": true },
             { "name": "Account", "value": info.account_index.to_string(), "inline": true },
-            { "name": "Budget", "value": fmt_usd(info.budget_usd), "inline": true },
-            { "name": "Leader cap", "value": fmt_usd(info.leader_max_exposure_usd), "inline": true },
+            { "name": "Balance", "value": balance, "inline": true },
             { "name": "Slippage", "value": format!("{} bps", info.slippage_bps), "inline": true },
+            { "name": "Leaders", "value": leaders_value, "inline": false },
         ],
         "timestamp": Utc::now().to_rfc3339(),
     });
@@ -457,9 +488,15 @@ fn build_orphan_embed(info: &OrphanAlert) -> Value {
         OrphanKind::BackfillFailed => ("🚨", "Backfill failed — possible missed leader events"),
     };
     let description = match info.kind {
-        OrphanKind::ReplayMirrorMissing => "A replayed leader OPEN has a `signals` row but no `trades` row. The previous run crashed mid-mirror — either the IOC was never sent (missed mirror), or it was sent and Lighter holds a position the DB never recorded. We did NOT re-fire; check Lighter for an unrecorded position and reconcile manually.",
-        OrphanKind::BackfillFailed => "Could not replay leader logs from the offline window. Any OPEN/CLOSE events the leader fired in the failed range are not recoverable from this session — inspect Lighter for unmirrored positions.",
-        _ => "Copy-state and Lighter disagree. Inspect manually with `cargo run --bin fix_drift list`; close any orphan position on Lighter directly.",
+        OrphanKind::ReplayMirrorMissing => {
+            "A replayed leader OPEN has a `signals` row but no `trades` row. The previous run crashed mid-mirror — either the IOC was never sent (missed mirror), or it was sent and Lighter holds a position the DB never recorded. We did NOT re-fire; check Lighter for an unrecorded position and reconcile manually."
+        }
+        OrphanKind::BackfillFailed => {
+            "Could not replay leader logs from the offline window. Any OPEN/CLOSE events the leader fired in the failed range are not recoverable from this session — inspect Lighter for unmirrored positions."
+        }
+        _ => {
+            "Copy-state and Lighter disagree. Inspect manually with `cargo run --bin fix_drift list`; close any orphan position on Lighter directly."
+        }
     };
     let title = format!("{prefix} {} · {}", headline, info.symbol);
     let embed = json!({
